@@ -1,11 +1,11 @@
-{
-  "versionCode": 4,
-  "versionName": "0.3.0-bootstrap",
-  "channel": "beta",
-  "minSupportedVersionCode": 4,
-  "apkUrl": "https://github.com/nhatkhoa-jpg/TrocAutoStudio-Releases/releases/download/v0.3.0-bootstrap/TrocAutoStudio-v0.3.0-bootstrap-FINAL.apk",
-  "sha256": "3f284714f8119d7e8d44b51d046871c9b45599eb915861fe6d281f37e327b4ae",
-  "sizeBytes": 81201619,
-  "releaseNotes": "Bootstrap đầu tiên có hệ thống tự cập nhật.",
-  "mandatory": false
+﻿{
+    "versionCode":  5,
+    "versionName":  "0.3.1-beta1",
+    "channel":  "beta",
+    "minSupportedVersionCode":  1,
+    "apkUrl":  "https://github.com/nhatkhoa-jpg/TrocAutoStudio-Releases/releases/download/v0.3.1-beta1/TrocAutoStudio-v0.3.1-beta1.apk",
+    "sha256":  "cc6edc779185d756fa97e5e56108a6cc5a33963c93f4032049aecb4977209882",
+    "sizeBytes":  81202827,
+    "releaseNotes":  "Self-update test: dynamic version UI and cleanup layout fix.",
+    "mandatory":  false
 }
