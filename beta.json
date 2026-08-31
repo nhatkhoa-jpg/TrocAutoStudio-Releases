@@ -1,12 +1,12 @@
 {
-  "versionCode": 822,
-  "versionName": "0.5.1-beta13",
+  "versionCode": 823,
+  "versionName": "0.5.2-beta14",
   "channel": "beta",
-  "sha256": "83de9ae27f1ea1634e4656ed761745bb95255e492a3cff2d1758ca74a2bf91af",
-  "sizeBytes": 106125394,
+  "sha256": "2066532352a453b14b4d1733472413ab6964bfc2a99db266f861ab75686a9323",
+  "sizeBytes": 106317458,
   "signingGeneration": 2,
   "releaseNotes": "Beta signing v2. Có thể cập nhật trực tiếp trong app; không cần gỡ phiên bản signing v2 đang dùng.",
-  "apkUrl": "https://github.com/nhatkhoa-jpg/TrocAutoStudio-Releases/releases/download/v0.5.1-beta13/TrocAutoStudio-v0.5.1-beta13-SIGNING-V2.apk",
+  "apkUrl": "https://github.com/nhatkhoa-jpg/TrocAutoStudio-Releases/releases/download/v0.5.2-beta14/TrocAutoStudio-v0.5.2-beta14-SIGNING-V2.apk",
   "minSupportedVersionCode": 1,
   "mandatory": false
 }
