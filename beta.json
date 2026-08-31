@@ -1,11 +1,11 @@
 {
-    "versionCode":  6,
-    "versionName":  "0.3.2-beta2",
+    "versionCode":  813,
+    "versionName":  "0.3.4-beta4",
     "channel":  "beta",
     "minSupportedVersionCode":  1,
-    "apkUrl":  "https://github.com/nhatkhoa-jpg/TrocAutoStudio-Releases/releases/download/v0.3.2-beta2/TrocAutoStudio-v0.3.2-beta2.apk",
-    "sha256":  "4ee5540a07b9a5e8d163ecdc33a5f814bd194382ec3e6c3f33b936dbf2a3f3cc",
-    "sizeBytes":  81225139,
-    "releaseNotes":  "Kiểm tra cập nhật trực tiếp trên Galaxy S25 Ultra. Sửa giao diện updater và Build ID.",
+    "apkUrl":  "https://github.com/nhatkhoa-jpg/TrocAutoStudio-Releases/releases/download/v0.3.4-beta4/TrocAutoStudio-v0.3.4-beta4.apk",
+    "sha256":  "6b4b0054f8c86ca637810f1bd910100f14ffe2f1099316765d9ee160341da63b",
+    "sizeBytes":  103373155,
+    "releaseNotes":  "Modern Material 3 UI redesign with five-tab navigation, dashboard, responsive updater and dark theme.",
     "mandatory":  false
 }
