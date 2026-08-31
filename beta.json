@@ -4,8 +4,8 @@
     "channel":  "beta",
     "minSupportedVersionCode":  1,
     "apkUrl":  "https://github.com/nhatkhoa-jpg/TrocAutoStudio-Releases/releases/download/v0.3.1-beta1/TrocAutoStudio-v0.3.1-beta1.apk",
-    "sha256":  "cc6edc779185d756fa97e5e56108a6cc5a33963c93f4032049aecb4977209882",
-    "sizeBytes":  81202827,
+    "sha256":  "72df31638ed774023db1c118120f7ee347b531989e602b614d23f9e594f8142b",
+    "sizeBytes":  81225227,
     "releaseNotes":  "Self-update test: dynamic version UI and cleanup layout fix.",
     "mandatory":  false
 }
