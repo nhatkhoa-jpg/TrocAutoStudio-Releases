@@ -2,7 +2,7 @@
   "versionCode": 829,
   "versionName": "0.5.8-beta20",
   "channel": "beta",
-  "sha256": "09d8922bba12dae0d78b3fda5a8eff6050db4827ea8606857de30579a91d96c4",
+  "sha256": "383061a4d5e2b54dc623464cb3ff0f7b0407551f4983e63ad3250e1bb49ece5d",
   "sizeBytes": 107463321,
   "signingGeneration": 2,
   "releaseNotes": "Beta signing v2. Có thể cập nhật trực tiếp trong app; không cần gỡ phiên bản signing v2 đang dùng.",
