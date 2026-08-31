@@ -1,11 +1,12 @@
 {
-    "versionCode":  814,
-    "versionName":  "0.3.5-beta5",
-    "channel":  "beta",
-    "minSupportedVersionCode":  1,
-    "apkUrl":  "https://github.com/nhatkhoa-jpg/TrocAutoStudio-Releases/releases/download/v0.3.5-beta5/TrocAutoStudio-v0.3.5-beta5.apk",
-    "sha256":  "cae15d41e992eb7238efb5b360b156ffc7cbc2d52b12ac39360b7aee5949cb41",
-    "sizeBytes":  103375375,
-    "releaseNotes":  "Final UI polish: distinct navigation icons, compact responsive cards and refreshed hero dashboard.",
-    "mandatory":  false
+  "versionCode": 820,
+  "versionName": "0.4.1-beta11",
+  "channel": "beta",
+  "sha256": "ed51ac855cfbc9b3de56531034c87f460438a52332b8ae1d9a8381ff9bf2d284",
+  "sizeBytes": 105944186,
+  "signingGeneration": 2,
+  "releaseNotes": "Signing key v2 bootstrap. Uninstall the old-signature app once before installing this APK.",
+  "apkUrl": "https://github.com/nhatkhoa-jpg/TrocAutoStudio-Releases/releases/download/v0.4.1-beta11/TrocAutoStudio-v0.4.1-beta11-SIGNING-V2.apk",
+  "minSupportedVersionCode": 1,
+  "mandatory": false
 }
