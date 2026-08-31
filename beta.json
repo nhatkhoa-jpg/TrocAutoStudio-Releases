@@ -1,12 +1,12 @@
 {
-  "versionCode": 820,
-  "versionName": "0.4.1-beta11",
+  "versionCode": 821,
+  "versionName": "0.5.0-beta12",
   "channel": "beta",
-  "sha256": "18b2d701a79a419b321a73127b64048ee5721ccebd7647ef867391283f6bc7ef",
-  "sizeBytes": 105944186,
+  "sha256": "3f1433c31c0055f99f6f4aaa2bd3bb4d0321d0479cba4cb135a598f4c136c2a4",
+  "sizeBytes": 106112286,
   "signingGeneration": 2,
   "releaseNotes": "Signing key v2 bootstrap. Uninstall the old-signature app once before installing this APK.",
-  "apkUrl": "https://github.com/nhatkhoa-jpg/TrocAutoStudio-Releases/releases/download/v0.4.1-beta11/TrocAutoStudio-v0.4.1-beta11-SIGNING-V2.apk",
+  "apkUrl": "https://github.com/nhatkhoa-jpg/TrocAutoStudio-Releases/releases/download/v0.5.0-beta12/TrocAutoStudio-v0.5.0-beta12-SIGNING-V2.apk",
   "minSupportedVersionCode": 1,
   "mandatory": false
 }
