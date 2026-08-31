@@ -2,7 +2,7 @@
   "versionCode": 820,
   "versionName": "0.4.1-beta11",
   "channel": "beta",
-  "sha256": "ed51ac855cfbc9b3de56531034c87f460438a52332b8ae1d9a8381ff9bf2d284",
+  "sha256": "18b2d701a79a419b321a73127b64048ee5721ccebd7647ef867391283f6bc7ef",
   "sizeBytes": 105944186,
   "signingGeneration": 2,
   "releaseNotes": "Signing key v2 bootstrap. Uninstall the old-signature app once before installing this APK.",
