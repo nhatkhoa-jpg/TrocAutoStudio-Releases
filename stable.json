@@ -1,0 +1,11 @@
+{
+  "versionCode": 4,
+  "versionName": "0.3.0-bootstrap",
+  "channel": "stable",
+  "minSupportedVersionCode": 4,
+  "apkUrl": "https://github.com/nhatkhoa-jpg/TrocAutoStudio-Releases/releases/download/v0.3.0-bootstrap/TrocAutoStudio-v0.3.0-bootstrap-FINAL.apk",
+  "sha256": "3f284714f8119d7e8d44b51d046871c9b45599eb915861fe6d281f37e327b4ae",
+  "sizeBytes": 81201619,
+  "releaseNotes": "Bootstrap đầu tiên có hệ thống tự cập nhật.",
+  "mandatory": false
+}
