@@ -1,11 +1,11 @@
 {
-    "versionCode":  5,
-    "versionName":  "0.3.1-beta1",
+    "versionCode":  6,
+    "versionName":  "0.3.2-beta2",
     "channel":  "beta",
     "minSupportedVersionCode":  1,
-    "apkUrl":  "https://github.com/nhatkhoa-jpg/TrocAutoStudio-Releases/releases/download/v0.3.1-beta1/TrocAutoStudio-v0.3.1-beta1.apk",
-    "sha256":  "72df31638ed774023db1c118120f7ee347b531989e602b614d23f9e594f8142b",
-    "sizeBytes":  81225227,
-    "releaseNotes":  "Self-update test: dynamic version UI and cleanup layout fix.",
+    "apkUrl":  "https://github.com/nhatkhoa-jpg/TrocAutoStudio-Releases/releases/download/v0.3.2-beta2/TrocAutoStudio-v0.3.2-beta2.apk",
+    "sha256":  "4ee5540a07b9a5e8d163ecdc33a5f814bd194382ec3e6c3f33b936dbf2a3f3cc",
+    "sizeBytes":  81225139,
+    "releaseNotes":  "Kiểm tra cập nhật trực tiếp trên Galaxy S25 Ultra. Sửa giao diện updater và Build ID.",
     "mandatory":  false
 }
