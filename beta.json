@@ -1,11 +1,11 @@
 {
-    "versionCode":  813,
-    "versionName":  "0.3.4-beta4",
+    "versionCode":  814,
+    "versionName":  "0.3.5-beta5",
     "channel":  "beta",
     "minSupportedVersionCode":  1,
-    "apkUrl":  "https://github.com/nhatkhoa-jpg/TrocAutoStudio-Releases/releases/download/v0.3.4-beta4/TrocAutoStudio-v0.3.4-beta4.apk",
-    "sha256":  "6b4b0054f8c86ca637810f1bd910100f14ffe2f1099316765d9ee160341da63b",
-    "sizeBytes":  103373155,
-    "releaseNotes":  "Modern Material 3 UI redesign with five-tab navigation, dashboard, responsive updater and dark theme.",
+    "apkUrl":  "https://github.com/nhatkhoa-jpg/TrocAutoStudio-Releases/releases/download/v0.3.5-beta5/TrocAutoStudio-v0.3.5-beta5.apk",
+    "sha256":  "cae15d41e992eb7238efb5b360b156ffc7cbc2d52b12ac39360b7aee5949cb41",
+    "sizeBytes":  103375375,
+    "releaseNotes":  "Final UI polish: distinct navigation icons, compact responsive cards and refreshed hero dashboard.",
     "mandatory":  false
 }
