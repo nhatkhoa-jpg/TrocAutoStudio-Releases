@@ -1,0 +1,40 @@
+name: Cleanup old Actions artifacts
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '23 4 * * *'
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Keep newest artifact, delete the rest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          python - <<'PY'
+          import json, os, urllib.request
+          token=os.environ['GH_TOKEN']; repo=os.environ['REPO']
+          headers={'Authorization':f'Bearer {token}','Accept':'application/vnd.github+json','X-GitHub-Api-Version':'2022-11-28'}
+          items=[]; page=1
+          while True:
+            req=urllib.request.Request(f'https://api.github.com/repos/{repo}/actions/artifacts?per_page=100&page={page}',headers=headers)
+            with urllib.request.urlopen(req) as r: batch=json.load(r)['artifacts']
+            items += batch
+            if len(batch)<100: break
+            page += 1
+          items.sort(key=lambda x:x['created_at'], reverse=True)
+          for a in items[1:]:
+            req=urllib.request.Request(f"https://api.github.com/repos/{repo}/actions/artifacts/{a['id']}",headers=headers,method='DELETE')
+            try: urllib.request.urlopen(req).read(); print('deleted',a['id'],a['name'],a['size_in_bytes'])
+            except Exception as e: print('delete_failed',a['id'],e)
+          print(f'artifacts={len(items)} kept_newest={min(1,len(items))} deleted={max(0,len(items)-1)}')
+          PY
