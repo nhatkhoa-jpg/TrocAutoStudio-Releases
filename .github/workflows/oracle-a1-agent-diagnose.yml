@@ -1,0 +1,77 @@
+name: Oracle A1 Agent Diagnose
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/oracle-a1-agent-diagnose.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      OCI_CONFIG: ${{ secrets.OCI_CONFIG }}
+      OCI_PRIVATE_KEY: ${{ secrets.OCI_PRIVATE_KEY }}
+      EXPECTED_REGION: ap-singapore-2
+      INSTANCE_NAME: troc-cloud-codex
+      EXPECTED_SHAPE: VM.Standard.A1.Flex
+    steps:
+      - name: Capture sanitized control-plane and serial diagnostics
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          test -n "$OCI_CONFIG" && test -n "$OCI_PRIVATE_KEY"
+          python -m pip install --disable-pip-version-check --quiet oci-cli
+          mkdir -p "$HOME/.oci"
+          printf '%s\n' "$OCI_PRIVATE_KEY" > "$HOME/.oci/key.pem"
+          chmod 600 "$HOME/.oci/key.pem"
+          printf '%s\n' "$OCI_CONFIG" > "$HOME/.oci/config"
+          if grep -q '^key_file=' "$HOME/.oci/config"; then
+            sed -i "s#^key_file=.*#key_file=$HOME/.oci/key.pem#" "$HOME/.oci/config"
+          else
+            printf 'key_file=%s\n' "$HOME/.oci/key.pem" >> "$HOME/.oci/config"
+          fi
+          chmod 600 "$HOME/.oci/config"
+          export SUPPRESS_LABEL_WARNING=True OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING=True
+          T="$(awk -F= '/^tenancy=/{gsub(/[[:space:]]/,"",$2);print $2;exit}' "$HOME/.oci/config")"
+          R="$(awk -F= '/^region=/{gsub(/[[:space:]]/,"",$2);print $2;exit}' "$HOME/.oci/config")"
+          test -n "$T" && test "$R" = "$EXPECTED_REGION"
+          J="$(oci compute instance list --compartment-id "$T" --region "$R" --display-name "$INSTANCE_NAME" --all | jq -c '[.data[]|select(."lifecycle-state"=="RUNNING")]|sort_by(."time-created")|last')"
+          test "$J" != null
+          ID="$(jq -r '.id' <<<"$J")"
+          SHAPE="$(jq -r '.shape' <<<"$J")"
+          CPU="$(jq -r '."shape-config".ocpus' <<<"$J")"
+          RAM="$(jq -r '."shape-config"."memory-in-gbs"' <<<"$J")"
+          test "$SHAPE" = "$EXPECTED_SHAPE"
+          awk -v v="$CPU" 'BEGIN{exit !(v<=2)}'
+          awk -v v="$RAM" 'BEGIN{exit !(v<=12)}'
+
+          echo '=== OCI instance agent plugins ==='
+          oci instance-agent plugin list --compartment-id "$T" --instanceagent-id "$ID" --region "$R" --all \
+            | jq -r '.data[]? | [.name,.status,(."time-last-updated" // ."time-created" // "-")] | @tsv' \
+            | sed -E 's/[[:space:]]+/ /g'
+
+          echo '=== Recent Run Command executions ==='
+          oci instance-agent command list --compartment-id "$T" --region "$R" --all 2>/dev/null \
+            | jq -r --arg id "$ID" '.data[]? | select(.target."instance-id"==$id or .target.instanceId==$id) | [.id,."display-name",."time-created"] | @tsv' \
+            | tail -n 12 || true
+
+          H=''
+          cleanup() {
+            set +e
+            [ -z "$H" ] || oci compute console-history delete --instance-console-history-id "$H" --region "$R" --force >/dev/null 2>&1 || true
+            rm -f "$HOME/.oci/key.pem" "$HOME/.oci/config" /tmp/console.log
+          }
+          trap cleanup EXIT
+          H="$(oci compute console-history capture --instance-id "$ID" --region "$R" --wait-for-state SUCCEEDED --wait-for-state FAILED --wait-interval-seconds 5 --query 'data.id' --raw-output)"
+          test -n "$H" && test "$H" != null
+          oci compute console-history get-content --instance-console-history-id "$H" --region "$R" --file /tmp/console.log
+          echo '=== Sanitized serial/cloud-agent diagnosis ==='
+          grep -Eai 'oracle-cloud-agent|instance.?agent|run.?command|cloud-init|cloud-final|scripts-user|wireguard|wg-quick|troc-ai|troc_|error|fail|traceback|timeout|systemd' /tmp/console.log \
+            | tail -n 350 \
+            | sed -E 's/((GEMINI_API_KEY|ENROLL_TOKEN|PRIVATE.?KEY|token|secret|key)[=:])[[:graph:]]+/\1[REDACTED]/Ig' || true
+          echo '=== End diagnosis ==='
