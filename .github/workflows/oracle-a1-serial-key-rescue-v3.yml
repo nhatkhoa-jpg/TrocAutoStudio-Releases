@@ -73,7 +73,8 @@ jobs:
           set boot 0
           for {set i 0} {$i < 180} {incr i} {
             send "\033"
-            expect -timeout 0.12 {
+            after 120
+            expect -timeout 0 {
               -re {Please select boot device:|Boot Manager|Boot Device} { set boot 1; puts "UEFI_OK"; break }
               timeout {}
             }
@@ -83,7 +84,8 @@ jobs:
           set grub 0
           for {set i 0} {$i < 120} {incr i} {
             send "\033"
-            expect -timeout 0.12 {
+            after 120
+            expect -timeout 0 {
               -re {GNU GRUB|Advanced options for Ubuntu|Ubuntu} { set grub 1; puts "GRUB_OK"; break }
               timeout {}
             }
@@ -93,7 +95,7 @@ jobs:
           after 700
           set found 0
           for {set i 0} {$i < 28} {incr i} {
-            expect -timeout 0.6 {
+            expect -timeout 1 {
               -re {linux[[:space:]]+[^\r\n]*} { set found 1; puts "LINUX_LINE_OK"; break }
               timeout {}
             }
