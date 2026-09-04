@@ -1,0 +1,209 @@
+name: Oracle A1 Rebuild Auto V2
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/oracle-a1-rebuild-auto-v2.yml'
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: oracle-a1-rebuild-auto-v2
+  cancel-in-progress: false
+
+jobs:
+  rebuild:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    env:
+      OCI_CONFIG: ${{ secrets.OCI_CONFIG }}
+      OCI_PRIVATE_KEY: ${{ secrets.OCI_PRIVATE_KEY }}
+      REGION: ap-singapore-2
+      INSTANCE_NAME: troc-cloud-codex
+      SHAPE: VM.Standard.A1.Flex
+      OCPUS: '2'
+      MEMORY_GB: '12'
+      BOOT_GB: '50'
+      VCN_NAME: troc-codex-vcn
+    steps:
+      - name: Configure OCI
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          test -n "$OCI_CONFIG" && test -n "$OCI_PRIVATE_KEY"
+          test "$SHAPE" = 'VM.Standard.A1.Flex'
+          test "$OCPUS" = '2' && test "$MEMORY_GB" = '12' && test "$BOOT_GB" = '50'
+          python -m pip install --disable-pip-version-check --quiet oci-cli
+          mkdir -p "$HOME/.oci"
+          printf '%s\n' "$OCI_PRIVATE_KEY" > "$HOME/.oci/key.pem"
+          chmod 600 "$HOME/.oci/key.pem"
+          printf '%s\n' "$OCI_CONFIG" > "$HOME/.oci/config"
+          if grep -q '^key_file=' "$HOME/.oci/config"; then
+            sed -i "s#^key_file=.*#key_file=$HOME/.oci/key.pem#" "$HOME/.oci/config"
+          else
+            echo "key_file=$HOME/.oci/key.pem" >> "$HOME/.oci/config"
+          fi
+          chmod 600 "$HOME/.oci/config"
+          TENANCY="$(awk -F= '/^tenancy=/{gsub(/[[:space:]]/,"",$2);print $2;exit}' "$HOME/.oci/config")"
+          CFG_REGION="$(awk -F= '/^region=/{gsub(/[[:space:]]/,"",$2);print $2;exit}' "$HOME/.oci/config")"
+          test -n "$TENANCY" && test "$CFG_REGION" = "$REGION"
+          echo "TENANCY=$TENANCY" >> "$GITHUB_ENV"
+          echo 'OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING=True' >> "$GITHUB_ENV"
+
+      - name: Preflight replacement inputs
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          AD="$(oci iam availability-domain list --compartment-id "$TENANCY" --region "$REGION" --query 'data[0].name' --raw-output)"
+          VCN="$(oci network vcn list --compartment-id "$TENANCY" --region "$REGION" --display-name "$VCN_NAME" --all | jq -r '[.data[]|select(."lifecycle-state"=="AVAILABLE")][0].id // empty')"
+          test -n "$AD" && test -n "$VCN"
+          SUBNET="$(oci network subnet list --compartment-id "$TENANCY" --region "$REGION" --vcn-id "$VCN" --all | jq -r '[.data[]|select(."lifecycle-state"=="AVAILABLE" and (."prohibit-public-ip-on-vnic"==false))][0].id // empty')"
+          [ -n "$SUBNET" ] || SUBNET="$(oci network subnet list --compartment-id "$TENANCY" --region "$REGION" --vcn-id "$VCN" --all | jq -r '[.data[]|select(."lifecycle-state"=="AVAILABLE")][0].id // empty')"
+          test -n "$SUBNET"
+          IMAGE="$(oci compute image list --compartment-id "$TENANCY" --region "$REGION" --operating-system 'Canonical Ubuntu' --operating-system-version '24.04' --shape "$SHAPE" --sort-by TIMECREATED --sort-order DESC --limit 1 --query 'data[0].id' --raw-output)"
+          test -n "$IMAGE" && test "$IMAGE" != null
+          echo "AD=$AD" >> "$GITHUB_ENV"
+          echo "SUBNET=$SUBNET" >> "$GITHUB_ENV"
+          echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
+          echo 'Preflight OK.'
+
+      - name: Terminate only stuck legacy compute and preserve boot volume
+        id: legacy
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          J="$(oci compute instance list --compartment-id "$TENANCY" --region "$REGION" --display-name "$INSTANCE_NAME" --all | jq -c '[.data[]|select(."lifecycle-state"!="TERMINATED")]|sort_by(."time-created")|last')"
+          if [ "$J" = null ]; then
+            echo 'need_launch=true' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          ID="$(jq -r '.id' <<<"$J")"
+          STATE="$(jq -r '."lifecycle-state"' <<<"$J")"
+          SH="$(jq -r '.shape' <<<"$J")"
+          CPU="$(jq -r '."shape-config".ocpus' <<<"$J")"
+          RAM="$(jq -r '."shape-config"."memory-in-gbs"' <<<"$J")"
+          MANAGED="$(jq -r '."freeform-tags"."troc-rebuild-v2" // empty' <<<"$J")"
+          test "$SH" = "$SHAPE"
+          awk -v v="$CPU" 'BEGIN{exit !(v<=2)}'
+          awk -v v="$RAM" 'BEGIN{exit !(v<=12)}'
+          echo "Found A1 state=$STATE managed=${MANAGED:-no}"
+
+          if [ "$STATE" = RUNNING ]; then
+            echo "INSTANCE_ID=$ID" >> "$GITHUB_ENV"
+            echo 'need_launch=false' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ "$MANAGED" = 1 ]; then
+            echo "Fresh replacement still $STATE; leave it alone and retry later."
+            echo 'need_launch=defer' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          BAD_AD="$(jq -r '."availability-domain"' <<<"$J")"
+          BV="$(oci compute boot-volume-attachment list --availability-domain "$BAD_AD" --compartment-id "$TENANCY" --instance-id "$ID" --region "$REGION" --all | jq -r '[.data[]|select(."lifecycle-state"!="DETACHED")][0]."boot-volume-id" // empty')"
+          test -n "$BV"
+          SIZE="$(oci bv boot-volume get --boot-volume-id "$BV" --region "$REGION" --query 'data."size-in-gbs"' --raw-output)"
+          test "$SIZE" = 50
+          echo "Preserving old boot volume $BV"
+          oci compute instance terminate --instance-id "$ID" --region "$REGION" --preserve-boot-volume true --force >/dev/null
+          for i in $(seq 1 90); do
+            S="$(oci compute instance get --instance-id "$ID" --region "$REGION" --query 'data."lifecycle-state"' --raw-output 2>/dev/null || echo TERMINATED)"
+            echo "terminate_check=$i state=$S"
+            [ "$S" = TERMINATED ] && break
+            sleep 10
+          done
+          S="$(oci compute instance get --instance-id "$ID" --region "$REGION" --query 'data."lifecycle-state"' --raw-output 2>/dev/null || echo TERMINATED)"
+          test "$S" = TERMINATED
+          echo 'need_launch=true' >> "$GITHUB_OUTPUT"
+
+      - name: Launch fresh 2 OCPU 12 GB A1 only
+        if: steps.legacy.outputs.need_launch == 'true'
+        id: launch
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          CFG="$(jq -cn --argjson c "$OCPUS" --argjson m "$MEMORY_GB" '{ocpus:$c,memoryInGBs:$m}')"
+          TAGS='{"troc-rebuild-v2":"1"}'
+          set +e
+          OUT="$(oci compute instance launch --region "$REGION" --compartment-id "$TENANCY" --availability-domain "$AD" --display-name "$INSTANCE_NAME" --shape "$SHAPE" --shape-config "$CFG" --image-id "$IMAGE" --boot-volume-size-in-gbs "$BOOT_GB" --subnet-id "$SUBNET" --assign-public-ip true --freeform-tags "$TAGS" 2>&1)"
+          RC=$?
+          set -e
+          if [ "$RC" -ne 0 ]; then
+            if grep -Eqi 'capacity|out of host capacity|limit|quota' <<<"$OUT"; then
+              echo 'capacity_wait=true' >> "$GITHUB_OUTPUT"
+              echo 'No A1 capacity right now; old boot volume remains preserved. Scheduled retry in 5 minutes.'
+              exit 0
+            fi
+            printf '%s\n' "$OUT"
+            exit "$RC"
+          fi
+          ID="$(jq -r '.data.id // empty' <<<"$OUT")"
+          test -n "$ID"
+          echo "INSTANCE_ID=$ID" >> "$GITHUB_ENV"
+          echo 'capacity_wait=false' >> "$GITHUB_OUTPUT"
+          echo "Fresh A1 launched: $ID"
+          oci compute instance get --instance-id "$ID" --region "$REGION" --wait-for-state RUNNING --max-wait-seconds 1200 >/dev/null
+
+      - name: Resolve RUNNING replacement
+        if: steps.legacy.outputs.need_launch != 'defer' && steps.launch.outputs.capacity_wait != 'true'
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          if [ -z "${INSTANCE_ID:-}" ]; then
+            J="$(oci compute instance list --compartment-id "$TENANCY" --region "$REGION" --display-name "$INSTANCE_NAME" --all | jq -c '[.data[]|select(."lifecycle-state"=="RUNNING")]|sort_by(."time-created")|last')"
+            test "$J" != null
+            INSTANCE_ID="$(jq -r '.id' <<<"$J")"
+            echo "INSTANCE_ID=$INSTANCE_ID" >> "$GITHUB_ENV"
+          fi
+          echo "Replacement RUNNING: $INSTANCE_ID"
+
+      - name: Run existing bootstrap workflow and wait
+        if: steps.legacy.outputs.need_launch != 'defer' && steps.launch.outputs.capacity_wait != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          gh workflow run oracle-a1-bootstrap.yml --repo "$GITHUB_REPOSITORY" --ref main
+          sleep 5
+          RID="$(gh run list --repo "$GITHUB_REPOSITORY" --workflow oracle-a1-bootstrap.yml --event workflow_dispatch --limit 1 --json databaseId --jq '.[0].databaseId')"
+          test -n "$RID"
+          echo "Bootstrap run: $RID"
+          gh run watch "$RID" --repo "$GITHUB_REPOSITORY" --exit-status
+
+      - name: Deploy Trọc AI private stack and wait
+        if: steps.legacy.outputs.need_launch != 'defer' && steps.launch.outputs.capacity_wait != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          gh workflow run oracle-a1-private-stack-deploy.yml --repo "$GITHUB_REPOSITORY" --ref main
+          sleep 5
+          RID="$(gh run list --repo "$GITHUB_REPOSITORY" --workflow oracle-a1-private-stack-deploy.yml --event workflow_dispatch --limit 1 --json databaseId --jq '.[0].databaseId')"
+          test -n "$RID"
+          echo "Private stack run: $RID"
+          gh run watch "$RID" --repo "$GITHUB_REPOSITORY" --exit-status
+
+      - name: Mark success and disable rebuild loop
+        if: steps.legacy.outputs.need_launch != 'defer' && steps.launch.outputs.capacity_wait != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          oci compute instance update --instance-id "$INSTANCE_ID" --region "$REGION" --freeform-tags '{"troc-rebuild-v2":"1","stack-ready":"1"}' --force >/dev/null
+          echo 'A1_REBUILD_AND_STACK_OK=1'
+          gh workflow disable oracle-a1-rebuild-auto-v2.yml --repo "$GITHUB_REPOSITORY" || true
+
+      - name: Cleanup OCI credentials
+        if: always()
+        shell: bash
+        run: rm -f "$HOME/.oci/key.pem" "$HOME/.oci/config"
