@@ -1,0 +1,131 @@
+name: Oracle A1 Finish
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/oracle-a1-finish.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: oracle-a1-finish
+  cancel-in-progress: false
+
+jobs:
+  finish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      EXPECTED_REGION: ap-singapore-2
+      INSTANCE_NAME: troc-cloud-codex
+      EXPECTED_SHAPE: VM.Standard.A1.Flex
+    steps:
+      - name: Verify fresh A1 is the only live target
+        env:
+          OCI_CONFIG: ${{ secrets.OCI_CONFIG }}
+          OCI_PRIVATE_KEY: ${{ secrets.OCI_PRIVATE_KEY }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          test -n "$OCI_CONFIG" && test -n "$OCI_PRIVATE_KEY"
+          python -m pip install --disable-pip-version-check --quiet oci-cli
+          mkdir -p "$HOME/.oci"
+          printf '%s\n' "$OCI_PRIVATE_KEY" > "$HOME/.oci/key.pem"
+          chmod 600 "$HOME/.oci/key.pem"
+          printf '%s\n' "$OCI_CONFIG" > "$HOME/.oci/config"
+          if grep -q '^key_file=' "$HOME/.oci/config"; then
+            sed -i "s#^key_file=.*#key_file=$HOME/.oci/key.pem#" "$HOME/.oci/config"
+          else
+            echo "key_file=$HOME/.oci/key.pem" >> "$HOME/.oci/config"
+          fi
+          chmod 600 "$HOME/.oci/config"
+          T="$(awk -F= '/^tenancy=/{gsub(/[[:space:]]/,"",$2);print $2;exit}' "$HOME/.oci/config")"
+          R="$(awk -F= '/^region=/{gsub(/[[:space:]]/,"",$2);print $2;exit}' "$HOME/.oci/config")"
+          test -n "$T" && test "$R" = "$EXPECTED_REGION"
+          J="$(oci compute instance list --compartment-id "$T" --region "$R" --display-name "$INSTANCE_NAME" --all | jq -c '[.data[]|select(."lifecycle-state"=="RUNNING")]|sort_by(."time-created")|last')"
+          test "$J" != null
+          SH="$(jq -r '.shape' <<<"$J")"
+          CPU="$(jq -r '."shape-config".ocpus' <<<"$J")"
+          RAM="$(jq -r '."shape-config"."memory-in-gbs"' <<<"$J")"
+          test "$SH" = "$EXPECTED_SHAPE"
+          test "$CPU" = '2.0' -o "$CPU" = '2'
+          test "$RAM" = '12.0' -o "$RAM" = '12'
+          ID="$(jq -r '.id' <<<"$J")"
+          PUB="$(oci compute instance list-vnics --instance-id "$ID" --region "$R" | jq -r '.data[]|select(."is-primary"==true)|."public-ip"' | head -1)"
+          echo "Fresh A1 verified: id=$ID public_ip=$PUB shape=$SH cpu=$CPU ram=$RAM"
+          rm -f "$HOME/.oci/key.pem" "$HOME/.oci/config"
+
+      - name: Run bootstrap workflow
+        id: bootstrap
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          before="$(gh run list --repo "$GITHUB_REPOSITORY" --workflow oracle-a1-bootstrap.yml --limit 1 --json databaseId --jq '.[0].databaseId // 0')"
+          gh workflow run oracle-a1-bootstrap.yml --repo "$GITHUB_REPOSITORY" --ref main
+          run_id=''
+          for i in $(seq 1 30); do
+            run_id="$(gh run list --repo "$GITHUB_REPOSITORY" --workflow oracle-a1-bootstrap.yml --limit 1 --json databaseId --jq '.[0].databaseId // 0')"
+            [ "$run_id" != "$before" ] && [ "$run_id" != 0 ] && break
+            sleep 2
+          done
+          test -n "$run_id" && [ "$run_id" != 0 ] && [ "$run_id" != "$before" ]
+          echo "Bootstrap run: $run_id"
+          gh run watch "$run_id" --repo "$GITHUB_REPOSITORY" --exit-status
+          echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
+
+      - name: Run private Trọc AI stack deploy
+        id: private_stack
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          before="$(gh run list --repo "$GITHUB_REPOSITORY" --workflow oracle-a1-private-stack-deploy.yml --limit 1 --json databaseId --jq '.[0].databaseId // 0')"
+          gh workflow run oracle-a1-private-stack-deploy.yml --repo "$GITHUB_REPOSITORY" --ref main
+          run_id=''
+          for i in $(seq 1 30); do
+            run_id="$(gh run list --repo "$GITHUB_REPOSITORY" --workflow oracle-a1-private-stack-deploy.yml --limit 1 --json databaseId --jq '.[0].databaseId // 0')"
+            [ "$run_id" != "$before" ] && [ "$run_id" != 0 ] && break
+            sleep 2
+          done
+          test -n "$run_id" && [ "$run_id" != 0 ] && [ "$run_id" != "$before" ]
+          echo "Private stack run: $run_id"
+          gh run watch "$run_id" --repo "$GITHUB_REPOSITORY" --exit-status
+          echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
+
+      - name: Run final read-only inspection
+        id: inspect
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          before="$(gh run list --repo "$GITHUB_REPOSITORY" --workflow oracle-a1-inspect.yml --limit 1 --json databaseId --jq '.[0].databaseId // 0')"
+          gh workflow run oracle-a1-inspect.yml --repo "$GITHUB_REPOSITORY" --ref main
+          run_id=''
+          for i in $(seq 1 30); do
+            run_id="$(gh run list --repo "$GITHUB_REPOSITORY" --workflow oracle-a1-inspect.yml --limit 1 --json databaseId --jq '.[0].databaseId // 0')"
+            [ "$run_id" != "$before" ] && [ "$run_id" != 0 ] && break
+            sleep 2
+          done
+          test -n "$run_id" && [ "$run_id" != 0 ] && [ "$run_id" != "$before" ]
+          echo "Inspection run: $run_id"
+          gh run watch "$run_id" --repo "$GITHUB_REPOSITORY" --exit-status
+          echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
+
+      - name: Finish summary
+        shell: bash
+        run: |
+          {
+            echo '## Oracle A1 finish orchestration completed'
+            echo "- Bootstrap run: ${{ steps.bootstrap.outputs.run_id }}"
+            echo "- Private stack run: ${{ steps.private_stack.outputs.run_id }}"
+            echo "- Final inspect run: ${{ steps.inspect.outputs.run_id }}"
+            echo '- Gemini API key remained in GitHub Secret and was consumed server-side by private stack workflow.'
+          } >> "$GITHUB_STEP_SUMMARY"
