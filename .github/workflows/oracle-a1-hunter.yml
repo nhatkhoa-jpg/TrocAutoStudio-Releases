@@ -4,6 +4,10 @@ on:
   workflow_dispatch:
   schedule:
     - cron: "*/15 * * * *"
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/oracle-a1-hunter.yml"
 
 permissions:
   contents: read
@@ -28,6 +32,7 @@ jobs:
       A1_MAX_OCPUS: '2'
       A1_MAX_MEMORY_GB: '12'
       A1_BOOT_VOLUME_GB: '50'
+      HUNTER_SUBNET_CIDR: 10.42.0.0/24
 
     steps:
       - name: Check required secrets
@@ -95,12 +100,12 @@ jobs:
           set -u
           COMPARTMENT_ID="$OCI_TENANCY_OCID"
 
-          # PAYG safety guard: this workflow may only create the intended Always-Free-size A1 VM.
+          # Hard PAYG guard. Never create another shape or exceed this envelope.
           if [ "$A1_SHAPE" != "VM.Standard.A1.Flex" ] || \
              [ "$A1_MAX_OCPUS" != "2" ] || \
              [ "$A1_MAX_MEMORY_GB" != "12" ] || \
              [ "$A1_BOOT_VOLUME_GB" != "50" ]; then
-            echo "::error::PAYG safety constants were changed. Refusing to launch any OCI instance."
+            echo "::error::PAYG safety constants changed; refusing to launch."
             echo "success=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -108,8 +113,7 @@ jobs:
           active_instance() {
             oci compute instance list \
               --compartment-id "$COMPARTMENT_ID" \
-              --display-name "$INSTANCE_NAME" \
-              --all 2>/dev/null |
+              --display-name "$INSTANCE_NAME" --all 2>/dev/null |
               jq -r '.data[] | select(."lifecycle-state" != "TERMINATED") | .id' |
               head -n1
           }
@@ -123,43 +127,31 @@ jobs:
             exit 0
           fi
 
-          # Refuse to stack another A1 instance in the same compartment. This prevents an
-          # accidental PAYG launch from exceeding the intended 2 OCPU / 12 GB envelope.
           EXISTING_A1_COUNT="$(oci compute instance list \
-            --compartment-id "$COMPARTMENT_ID" \
-            --all 2>/dev/null |
+            --compartment-id "$COMPARTMENT_ID" --all 2>/dev/null |
             jq --arg shape "$A1_SHAPE" '[.data[] | select(.shape == $shape and ."lifecycle-state" != "TERMINATED")] | length' 2>/dev/null || echo 0)"
           if [ "${EXISTING_A1_COUNT:-0}" -gt 0 ]; then
-            echo "::warning::Another non-terminated $A1_SHAPE instance already exists in this compartment. Refusing to create a second A1 instance under PAYG safety mode."
+            echo "::warning::Another live A1 already exists; refusing to create a second one."
             echo "success=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          AD="$(oci iam availability-domain list \
-            --compartment-id "$COMPARTMENT_ID" \
-            --query 'data[0].name' --raw-output 2>/dev/null)"
+          AD="$(oci iam availability-domain list --compartment-id "$COMPARTMENT_ID" --query 'data[0].name' --raw-output 2>/dev/null)"
           if [ -z "$AD" ] || [ "$AD" = "null" ]; then
-            echo "::warning::Could not resolve availability domain. Will retry next run."
+            echo "::warning::Could not resolve availability domain."
             echo "success=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           echo "Availability domain: $AD"
 
           VCN_ID="$(oci network vcn list \
-            --compartment-id "$COMPARTMENT_ID" \
-            --display-name "$VCN_NAME" \
-            --all 2>/dev/null |
-            jq -r '.data[] | select(."lifecycle-state"=="AVAILABLE") | .id' |
-            head -n1)"
-
+            --compartment-id "$COMPARTMENT_ID" --display-name "$VCN_NAME" --all 2>/dev/null |
+            jq -r '.data[] | select(."lifecycle-state"=="AVAILABLE") | .id' | head -n1)"
           if [ -z "$VCN_ID" ]; then
-            echo "Creating minimal hunter VCN..."
+            echo "Creating hunter VCN..."
             set +e
-            VCN_OUT="$(oci network vcn create \
-              --compartment-id "$COMPARTMENT_ID" \
-              --cidr-block "10.42.0.0/16" \
-              --display-name "$VCN_NAME" \
-              --wait-for-state AVAILABLE 2>&1)"
+            VCN_OUT="$(oci network vcn create --compartment-id "$COMPARTMENT_ID" \
+              --cidr-block "10.42.0.0/16" --display-name "$VCN_NAME" --wait-for-state AVAILABLE 2>&1)"
             rc=$?
             set -e
             if [ "$rc" -ne 0 ]; then
@@ -170,39 +162,28 @@ jobs:
             fi
             VCN_ID="$(printf '%s' "$VCN_OUT" | jq -r '.data.id // empty' 2>/dev/null)"
           fi
-
-          if [ -z "$VCN_ID" ]; then
-            VCN_ID="$(oci network vcn list \
-              --compartment-id "$COMPARTMENT_ID" \
-              --display-name "$VCN_NAME" --all 2>/dev/null |
-              jq -r '.data[] | select(."lifecycle-state"=="AVAILABLE") | .id' |
-              head -n1)"
-          fi
-
-          if [ -z "$VCN_ID" ]; then
-            echo "::warning::No usable VCN yet; will retry next run."
-            echo "success=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
           echo "Using VCN: $VCN_ID"
 
+          # Reuse an existing subnet even if an earlier hunter gave it a different name.
+          # This fixes the previous loop where 10.42.0.0/24 already existed and OCI rejected
+          # every attempt to create the same CIDR again.
           SUBNET_ID="$(oci network subnet list \
-            --compartment-id "$COMPARTMENT_ID" \
-            --vcn-id "$VCN_ID" \
-            --display-name "$SUBNET_NAME" \
-            --all 2>/dev/null |
-            jq -r '.data[] | select(."lifecycle-state"=="AVAILABLE") | .id' |
+            --compartment-id "$COMPARTMENT_ID" --vcn-id "$VCN_ID" --all 2>/dev/null |
+            jq -r --arg cidr "$HUNTER_SUBNET_CIDR" '.data[] | select(."lifecycle-state"=="AVAILABLE" and ."cidr-block"==$cidr) | .id' |
             head -n1)"
 
           if [ -z "$SUBNET_ID" ]; then
-            echo "Creating minimal hunter subnet..."
+            SUBNET_ID="$(oci network subnet list \
+              --compartment-id "$COMPARTMENT_ID" --vcn-id "$VCN_ID" --display-name "$SUBNET_NAME" --all 2>/dev/null |
+              jq -r '.data[] | select(."lifecycle-state"=="AVAILABLE") | .id' | head -n1)"
+          fi
+
+          if [ -z "$SUBNET_ID" ]; then
+            echo "Creating hunter subnet..."
             set +e
-            SUBNET_OUT="$(oci network subnet create \
-              --compartment-id "$COMPARTMENT_ID" \
-              --vcn-id "$VCN_ID" \
-              --cidr-block "10.42.0.0/24" \
-              --display-name "$SUBNET_NAME" \
-              --prohibit-public-ip-on-vnic true \
+            SUBNET_OUT="$(oci network subnet create --compartment-id "$COMPARTMENT_ID" \
+              --vcn-id "$VCN_ID" --cidr-block "$HUNTER_SUBNET_CIDR" \
+              --display-name "$SUBNET_NAME" --prohibit-public-ip-on-vnic true \
               --wait-for-state AVAILABLE 2>&1)"
             rc=$?
             set -e
@@ -216,33 +197,18 @@ jobs:
           fi
 
           if [ -z "$SUBNET_ID" ]; then
-            SUBNET_ID="$(oci network subnet list \
-              --compartment-id "$COMPARTMENT_ID" \
-              --vcn-id "$VCN_ID" \
-              --display-name "$SUBNET_NAME" --all 2>/dev/null |
-              jq -r '.data[] | select(."lifecycle-state"=="AVAILABLE") | .id' |
-              head -n1)"
-          fi
-
-          if [ -z "$SUBNET_ID" ]; then
-            echo "::warning::No usable subnet yet; will retry next run."
+            echo "::warning::No usable subnet found."
             echo "success=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           echo "Using subnet: $SUBNET_ID"
 
-          IMAGE_ID="$(oci compute image list \
-            --compartment-id "$COMPARTMENT_ID" \
-            --operating-system "Canonical Ubuntu" \
-            --operating-system-version "24.04" \
-            --shape "$A1_SHAPE" \
-            --sort-by TIMECREATED \
-            --sort-order DESC \
-            --limit 1 \
+          IMAGE_ID="$(oci compute image list --compartment-id "$COMPARTMENT_ID" \
+            --operating-system "Canonical Ubuntu" --operating-system-version "24.04" \
+            --shape "$A1_SHAPE" --sort-by TIMECREATED --sort-order DESC --limit 1 \
             --query 'data[0].id' --raw-output 2>/dev/null)"
-
           if [ -z "$IMAGE_ID" ] || [ "$IMAGE_ID" = "null" ]; then
-            echo "::warning::No compatible Ubuntu 24.04 A1 image yet; will retry."
+            echo "::warning::No compatible Ubuntu 24.04 A1 image found."
             echo "success=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -251,48 +217,33 @@ jobs:
           METADATA="$(jq -cn --arg key "$OCI_SSH_PUBLIC_KEY" '{ssh_authorized_keys:$key}')"
 
           try_launch() {
-            local ocpus="$1"
-            local memory="$2"
-            local cfg output rc instance_id
-
+            local ocpus="$1" memory="$2" cfg output rc instance_id
             if [ "$ocpus" -gt "$A1_MAX_OCPUS" ] || [ "$memory" -gt "$A1_MAX_MEMORY_GB" ]; then
-              echo "::error::Refusing launch outside PAYG safety envelope: ${ocpus} OCPU / ${memory} GB"
+              echo "::error::Refusing launch outside PAYG safety envelope."
               return 1
             fi
-
             cfg="$(jq -cn --argjson c "$ocpus" --argjson m "$memory" '{ocpus:$c,memoryInGBs:$m}')"
             echo "Trying A1: ${ocpus} OCPU / ${memory} GB / ${A1_BOOT_VOLUME_GB} GB boot"
-
             set +e
-            output="$(oci compute instance launch \
-              --compartment-id "$COMPARTMENT_ID" \
-              --availability-domain "$AD" \
-              --display-name "$INSTANCE_NAME" \
-              --shape "$A1_SHAPE" \
-              --shape-config "$cfg" \
-              --image-id "$IMAGE_ID" \
-              --boot-volume-size-in-gbs "$A1_BOOT_VOLUME_GB" \
-              --subnet-id "$SUBNET_ID" \
-              --assign-public-ip false \
-              --metadata "$METADATA" 2>&1)"
+            output="$(oci compute instance launch --compartment-id "$COMPARTMENT_ID" \
+              --availability-domain "$AD" --display-name "$INSTANCE_NAME" \
+              --shape "$A1_SHAPE" --shape-config "$cfg" --image-id "$IMAGE_ID" \
+              --boot-volume-size-in-gbs "$A1_BOOT_VOLUME_GB" --subnet-id "$SUBNET_ID" \
+              --assign-public-ip false --metadata "$METADATA" 2>&1)"
             rc=$?
             set -e
-
             if [ "$rc" -eq 0 ]; then
               instance_id="$(printf '%s' "$output" | jq -r '.data.id // empty' 2>/dev/null)"
-              if [ -z "$instance_id" ]; then
-                instance_id="$(active_instance || true)"
-              fi
+              [ -n "$instance_id" ] || instance_id="$(active_instance || true)"
               echo "A1 ACQUIRED: $instance_id"
               echo "success=true" >> "$GITHUB_OUTPUT"
               echo "instance_id=$instance_id" >> "$GITHUB_OUTPUT"
               return 0
             fi
-
             if printf '%s' "$output" | grep -Eqi 'out of capacity|out of host capacity|capacity'; then
               echo "No A1 capacity for ${ocpus}/${memory} right now."
             else
-              echo "::warning::Launch attempt failed for a non-capacity reason; next run will retry."
+              echo "::warning::Launch failed for a non-capacity reason."
               printf '%s\n' "$output"
             fi
             return 1
@@ -302,13 +253,12 @@ jobs:
           if try_launch 1 6; then exit 0; fi
 
           echo "success=false" >> "$GITHUB_OUTPUT"
-          echo "No A1 acquired this run. Will automatically retry in about 15 minutes."
+          echo "No A1 acquired this run. Will retry automatically."
           {
             echo "## Oracle A1 Hunter"
             echo ""
-            echo "No A1 capacity acquired this run."
-            echo "Next automatic attempt: about 15 minutes."
-            echo "PAYG safety envelope: max 2 OCPU / 12 GB RAM / 50 GB boot volume; no paid-shape fallback."
+            echo "No A1 acquired this run."
+            echo "PAYG safety max: 2 OCPU / 12 GB RAM / 50 GB boot; no paid-shape fallback."
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Record success
@@ -325,7 +275,7 @@ jobs:
             echo "- Shape: \`VM.Standard.A1.Flex\`"
             echo "- PAYG safety max: \`2 OCPU / 12 GB RAM / 50 GB boot\`"
             echo "- SSH user: \`ubuntu\`"
-            echo "- Public IP: not assigned yet (intentional for robust capacity hunting)"
+            echo "- Public IP: not assigned yet; networking/bootstrap will be configured after acquisition"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Disable hunter after success
