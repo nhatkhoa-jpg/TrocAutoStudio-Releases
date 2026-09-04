@@ -17,6 +17,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          echo 'Rechecking current A1 during cloud-init recovery.'
           python -m pip install --disable-pip-version-check --quiet oci-cli
           mkdir -p "$HOME/.oci"
           printf '%s\n' "$OCI_PRIVATE_KEY" > "$HOME/.oci/key.pem"; chmod 600 "$HOME/.oci/key.pem"
