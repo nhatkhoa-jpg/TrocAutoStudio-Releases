@@ -1,0 +1,305 @@
+name: Oracle A1 Hunter
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 * * * *"
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: oracle-a1-hunter
+  cancel-in-progress: false
+
+jobs:
+  hunt:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    env:
+      OCI_TENANCY_OCID: ${{ secrets.OCI_TENANCY_OCID }}
+      OCI_USER_OCID: ${{ secrets.OCI_USER_OCID }}
+      OCI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
+      OCI_PRIVATE_KEY: ${{ secrets.OCI_PRIVATE_KEY }}
+      OCI_REGION: ${{ secrets.OCI_REGION }}
+      OCI_SSH_PUBLIC_KEY: ${{ secrets.OCI_SSH_PUBLIC_KEY }}
+      INSTANCE_NAME: troc-cloud-codex
+      VCN_NAME: troc-codex-vcn
+      SUBNET_NAME: troc-codex-public
+      IGW_NAME: troc-codex-igw
+      SECLIST_NAME: troc-codex-ssh
+
+    steps:
+      - name: Check required secrets
+        id: preflight
+        shell: bash
+        run: |
+          set -euo pipefail
+          missing=0
+          for v in OCI_TENANCY_OCID OCI_USER_OCID OCI_FINGERPRINT OCI_PRIVATE_KEY OCI_REGION OCI_SSH_PUBLIC_KEY; do
+            if [ -z "${!v:-}" ]; then
+              echo "::warning::$v is not configured yet"
+              missing=1
+            fi
+          done
+          if [ "$missing" -eq 1 ]; then
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "Hunter installed but waiting for GitHub Secrets."
+          else
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install OCI CLI
+        if: steps.preflight.outputs.ready == 'true'
+        shell: bash
+        run: |
+          python -m pip install --disable-pip-version-check --quiet oci-cli
+          oci --version
+
+      - name: Configure OCI CLI
+        if: steps.preflight.outputs.ready == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.oci"
+          printf '%s\n' "$OCI_PRIVATE_KEY" > "$HOME/.oci/oci_api_key.pem"
+          chmod 600 "$HOME/.oci/oci_api_key.pem"
+          cat > "$HOME/.oci/config" <<EOF
+          [DEFAULT]
+          user=$OCI_USER_OCID
+          fingerprint=$OCI_FINGERPRINT
+          tenancy=$OCI_TENANCY_OCID
+          region=$OCI_REGION
+          key_file=$HOME/.oci/oci_api_key.pem
+          EOF
+          chmod 600 "$HOME/.oci/config"
+          oci iam region-subscription list --tenancy-id "$OCI_TENANCY_OCID" >/dev/null
+          echo "OCI authentication OK."
+
+      - name: Hunt A1 capacity
+        if: steps.preflight.outputs.ready == 'true'
+        id: hunt
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          COMPARTMENT_ID="$OCI_TENANCY_OCID"
+
+          active_instance() {
+            oci compute instance list \
+              --compartment-id "$COMPARTMENT_ID" \
+              --display-name "$INSTANCE_NAME" \
+              --all |
+              jq -r '.data[] | select(."lifecycle-state" != "TERMINATED") | .id' |
+              head -n1
+          }
+
+          existing="$(active_instance || true)"
+          if [ -n "$existing" ] && [ "$existing" != "null" ]; then
+            state="$(oci compute instance get --instance-id "$existing" --query 'data."lifecycle-state"' --raw-output)"
+            echo "Instance already exists: $existing ($state)"
+            echo "success=true" >> "$GITHUB_OUTPUT"
+            echo "instance_id=$existing" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          AD="$(oci iam availability-domain list \
+            --compartment-id "$COMPARTMENT_ID" \
+            --query 'data[0].name' --raw-output)"
+          echo "Availability domain: $AD"
+
+          VCN_ID="$(oci network vcn list \
+            --compartment-id "$COMPARTMENT_ID" \
+            --display-name "$VCN_NAME" --all |
+            jq -r '.data[] | select(."lifecycle-state"=="AVAILABLE") | .id' |
+            head -n1)"
+
+          if [ -z "$VCN_ID" ]; then
+            VCN_ID="$(oci network vcn create \
+              --compartment-id "$COMPARTMENT_ID" \
+              --cidr-block "10.42.0.0/16" \
+              --display-name "$VCN_NAME" \
+              --dns-label "troccodex" \
+              --wait-for-state AVAILABLE \
+              --query 'data.id' --raw-output)"
+            echo "Created VCN: $VCN_ID"
+          else
+            echo "Using VCN: $VCN_ID"
+          fi
+
+          RT_ID="$(oci network vcn get --vcn-id "$VCN_ID" \
+            --query 'data."default-route-table-id"' --raw-output)"
+
+          IGW_ID="$(oci network internet-gateway list \
+            --compartment-id "$COMPARTMENT_ID" \
+            --vcn-id "$VCN_ID" \
+            --display-name "$IGW_NAME" --all |
+            jq -r '.data[] | select(."lifecycle-state"=="AVAILABLE") | .id' |
+            head -n1)"
+
+          if [ -z "$IGW_ID" ]; then
+            IGW_ID="$(oci network internet-gateway create \
+              --compartment-id "$COMPARTMENT_ID" \
+              --vcn-id "$VCN_ID" \
+              --is-enabled true \
+              --display-name "$IGW_NAME" \
+              --wait-for-state AVAILABLE \
+              --query 'data.id' --raw-output)"
+            echo "Created Internet Gateway: $IGW_ID"
+          fi
+
+          oci network route-table update \
+            --rt-id "$RT_ID" \
+            --route-rules "[{\"cidrBlock\":\"0.0.0.0/0\",\"networkEntityId\":\"$IGW_ID\"}]" \
+            --force >/dev/null
+
+          SECLIST_ID="$(oci network security-list list \
+            --compartment-id "$COMPARTMENT_ID" \
+            --vcn-id "$VCN_ID" \
+            --display-name "$SECLIST_NAME" --all |
+            jq -r '.data[] | select(."lifecycle-state"=="AVAILABLE") | .id' |
+            head -n1)"
+
+          if [ -z "$SECLIST_ID" ]; then
+            EGRESS='[{"destination":"0.0.0.0/0","protocol":"all","isStateless":false}]'
+            INGRESS='[{"source":"0.0.0.0/0","protocol":"6","isStateless":false,"tcpOptions":{"destinationPortRange":{"min":22,"max":22},"sourcePortRange":null}}]'
+            SECLIST_ID="$(oci network security-list create \
+              --compartment-id "$COMPARTMENT_ID" \
+              --vcn-id "$VCN_ID" \
+              --display-name "$SECLIST_NAME" \
+              --egress-security-rules "$EGRESS" \
+              --ingress-security-rules "$INGRESS" \
+              --wait-for-state AVAILABLE \
+              --query 'data.id' --raw-output)"
+            echo "Created security list: $SECLIST_ID"
+          fi
+
+          SUBNET_ID="$(oci network subnet list \
+            --compartment-id "$COMPARTMENT_ID" \
+            --vcn-id "$VCN_ID" \
+            --display-name "$SUBNET_NAME" --all |
+            jq -r '.data[] | select(."lifecycle-state"=="AVAILABLE") | .id' |
+            head -n1)"
+
+          if [ -z "$SUBNET_ID" ]; then
+            SUBNET_ID="$(oci network subnet create \
+              --compartment-id "$COMPARTMENT_ID" \
+              --vcn-id "$VCN_ID" \
+              --cidr-block "10.42.0.0/24" \
+              --display-name "$SUBNET_NAME" \
+              --dns-label "codex" \
+              --route-table-id "$RT_ID" \
+              --security-list-ids "[\"$SECLIST_ID\"]" \
+              --prohibit-public-ip-on-vnic false \
+              --wait-for-state AVAILABLE \
+              --query 'data.id' --raw-output)"
+            echo "Created subnet: $SUBNET_ID"
+          fi
+
+          IMAGE_ID="$(oci compute image list \
+            --compartment-id "$COMPARTMENT_ID" \
+            --operating-system "Canonical Ubuntu" \
+            --operating-system-version "24.04" \
+            --shape "VM.Standard.A1.Flex" \
+            --sort-by TIMECREATED \
+            --sort-order DESC \
+            --limit 1 \
+            --query 'data[0].id' --raw-output)"
+
+          if [ -z "$IMAGE_ID" ] || [ "$IMAGE_ID" = "null" ]; then
+            echo "::error::No compatible Canonical Ubuntu 24.04 image found."
+            exit 1
+          fi
+          echo "Ubuntu image: $IMAGE_ID"
+
+          METADATA="$(jq -cn --arg key "$OCI_SSH_PUBLIC_KEY" '{ssh_authorized_keys:$key}')"
+
+          try_launch() {
+            local ocpus="$1"
+            local memory="$2"
+            local cfg
+            cfg="$(jq -cn --argjson c "$ocpus" --argjson m "$memory" '{ocpus:$c,memoryInGBs:$m}')"
+
+            echo "Trying VM.Standard.A1.Flex: ${ocpus} OCPU / ${memory} GB ..."
+            set +e
+            output="$(oci compute instance launch \
+              --compartment-id "$COMPARTMENT_ID" \
+              --availability-domain "$AD" \
+              --display-name "$INSTANCE_NAME" \
+              --shape "VM.Standard.A1.Flex" \
+              --shape-config "$cfg" \
+              --image-id "$IMAGE_ID" \
+              --subnet-id "$SUBNET_ID" \
+              --assign-public-ip true \
+              --metadata "$METADATA" \
+              --wait-for-state RUNNING \
+              --wait-interval-seconds 15 \
+              --max-wait-seconds 600 2>&1)"
+            rc=$?
+            set -e
+
+            if [ "$rc" -eq 0 ]; then
+              instance_id="$(printf '%s' "$output" | jq -r '.data.id // empty' 2>/dev/null || true)"
+              if [ -z "$instance_id" ]; then
+                instance_id="$(active_instance || true)"
+              fi
+              echo "SUCCESS: $instance_id"
+              echo "success=true" >> "$GITHUB_OUTPUT"
+              echo "instance_id=$instance_id" >> "$GITHUB_OUTPUT"
+              return 0
+            fi
+
+            if printf '%s' "$output" | grep -Eqi 'Out of capacity|Out of host capacity|capacity'; then
+              echo "No A1 capacity for ${ocpus}/${memory} right now."
+              return 1
+            fi
+
+            echo "::error::OCI launch failed for a reason other than capacity."
+            printf '%s\n' "$output"
+            exit "$rc"
+          }
+
+          if try_launch 2 12; then
+            exit 0
+          fi
+
+          if try_launch 1 6; then
+            exit 0
+          fi
+
+          echo "success=false" >> "$GITHUB_OUTPUT"
+          echo "No A1 capacity this hour. The next scheduled run will try again."
+
+      - name: Show public IP
+        if: steps.preflight.outputs.ready == 'true' && steps.hunt.outputs.success == 'true'
+        shell: bash
+        env:
+          INSTANCE_ID: ${{ steps.hunt.outputs.instance_id }}
+        run: |
+          set -euo pipefail
+          VNIC_ID="$(oci compute vnic-attachment list \
+            --compartment-id "$OCI_TENANCY_OCID" \
+            --instance-id "$INSTANCE_ID" \
+            --query 'data[0]."vnic-id"' --raw-output)"
+          PUBLIC_IP="$(oci network vnic get --vnic-id "$VNIC_ID" \
+            --query 'data."public-ip"' --raw-output)"
+          echo "Oracle A1 is ready."
+          echo "Public IP: $PUBLIC_IP"
+          echo "SSH user: ubuntu"
+          {
+            echo "## Oracle A1 acquired"
+            echo ""
+            echo "- Instance: \`$INSTANCE_ID\`"
+            echo "- Public IP: \`$PUBLIC_IP\`"
+            echo "- SSH user: \`ubuntu\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Disable hunter after success
+        if: steps.preflight.outputs.ready == 'true' && steps.hunt.outputs.success == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          gh workflow disable oracle-a1-hunter.yml --repo "$GITHUB_REPOSITORY" || true
+          echo "Hunter disabled after successful acquisition."
