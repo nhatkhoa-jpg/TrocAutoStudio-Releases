@@ -1,0 +1,55 @@
+name: Oracle A1 Serial Snapshot
+
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/oracle-a1-serial-snapshot.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      OCI_CONFIG: ${{ secrets.OCI_CONFIG }}
+      OCI_PRIVATE_KEY: ${{ secrets.OCI_PRIVATE_KEY }}
+      EXPECTED_REGION: ap-singapore-2
+      INSTANCE_NAME: troc-cloud-codex
+    steps:
+      - name: Capture serial state
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python -m pip install --disable-pip-version-check --quiet oci-cli
+          sudo apt-get update -qq && sudo apt-get install -y -qq expect >/dev/null
+          mkdir -p "$HOME/.oci"; printf '%s\n' "$OCI_PRIVATE_KEY" > "$HOME/.oci/key.pem"; chmod 600 "$HOME/.oci/key.pem"; printf '%s\n' "$OCI_CONFIG" > "$HOME/.oci/config"
+          if grep -q '^key_file=' "$HOME/.oci/config"; then sed -i "s#^key_file=.*#key_file=$HOME/.oci/key.pem#" "$HOME/.oci/config"; else echo "key_file=$HOME/.oci/key.pem" >> "$HOME/.oci/config"; fi
+          chmod 600 "$HOME/.oci/config"; export SUPPRESS_LABEL_WARNING=True OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING=True
+          T="$(awk -F= '/^tenancy=/{gsub(/[[:space:]]/,"",$2);print $2;exit}' "$HOME/.oci/config")"; R="$(awk -F= '/^region=/{gsub(/[[:space:]]/,"",$2);print $2;exit}' "$HOME/.oci/config")"; test "$R" = "$EXPECTED_REGION"
+          J="$(oci compute instance list --compartment-id "$T" --region "$R" --display-name "$INSTANCE_NAME" --all | jq -c '[.data[]|select(."lifecycle-state"=="RUNNING")]|sort_by(."time-created")|last')"; test "$J" != null
+          ID="$(jq -r '.id' <<<"$J")"; test "$(jq -r '.shape' <<<"$J")" = 'VM.Standard.A1.Flex'; awk -v v="$(jq -r '."shape-config".ocpus' <<<"$J")" 'BEGIN{exit !(v<=2)}'; awk -v v="$(jq -r '."shape-config"."memory-in-gbs"' <<<"$J")" 'BEGIN{exit !(v<=12)}'
+          mapfile -t CCS < <(oci compute instance-console-connection list --compartment-id "$T" --instance-id "$ID" --region "$R" --all | jq -r '.data[]|select(."lifecycle-state"!="DELETED" and ."lifecycle-state"!="DELETING")|.id')
+          for cc in "${CCS[@]}"; do [ -n "$cc" ] && oci compute instance-console-connection delete --instance-console-connection-id "$cc" --region "$R" --force >/dev/null 2>&1 || true; done
+          sleep 3; ssh-keygen -q -t rsa -b 2048 -N '' -f /tmp/console_rsa
+          CCJSON="$(oci compute instance-console-connection create --instance-id "$ID" --region "$R" --ssh-public-key-file /tmp/console_rsa.pub --wait-for-state ACTIVE --wait-interval-seconds 3)"; CCID="$(jq -r '.data.id' <<<"$CCJSON")"
+          cleanup(){ oci compute instance-console-connection delete --instance-console-connection-id "$CCID" --region "$R" --force >/dev/null 2>&1 || true; rm -f /tmp/console_rsa* /tmp/connect-console.sh /tmp/snap.exp; }; trap cleanup EXIT
+          cat >/tmp/connect-console.sh <<EOF
+          #!/usr/bin/env bash
+          exec ssh -tt -i /tmp/console_rsa -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o "ProxyCommand=ssh -i /tmp/console_rsa -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -W %h:%p -p 443 ${CCID}@instance-console.${R}.oci.oraclecloud.com" ${ID}
+          EOF
+          chmod 700 /tmp/connect-console.sh
+          cat >/tmp/snap.exp <<'EXP'
+          set timeout 15
+          log_user 1
+          spawn /tmp/connect-console.sh
+          after 3500
+          send "\r"
+          after 5000
+          send "~."
+          expect eof
+          EXP
+          expect /tmp/snap.exp || true
+          echo SERIAL_SNAPSHOT_DONE
