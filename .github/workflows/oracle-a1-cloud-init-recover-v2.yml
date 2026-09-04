@@ -14,7 +14,7 @@ permissions:
 
 concurrency:
   group: oracle-a1-cloud-init-recover
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   recover:
