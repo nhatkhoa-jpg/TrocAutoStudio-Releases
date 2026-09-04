@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+  <meta name="theme-color" content="#0f0f10" />
+  <meta name="description" content="Trọc AI - giao diện riêng cho Oracle A1" />
+  <link rel="manifest" href="/manifest.webmanifest" />
+  <link rel="icon" href="/icon.svg" type="image/svg+xml" />
+  <link rel="stylesheet" href="/app.css" />
+  <title>Trọc AI</title>
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <div class="brand"><span class="brand-mark">T</span><div><strong>Trọc AI</strong><small id="statusText">Đang kết nối A1…</small></div></div>
+      <button id="newChat" class="icon-btn" aria-label="Cuộc trò chuyện mới">＋</button>
+    </header>
+
+    <main id="chat" class="chat" aria-live="polite">
+      <section id="welcome" class="welcome">
+        <div class="orb">T</div>
+        <h1>Chào anh Trọc</h1>
+        <p>Trợ lý riêng chạy 24/7 trên Oracle A1 Singapore.</p>
+        <div class="chips">
+          <button data-prompt="Kiểm tra tình trạng các worker và cho tôi biết việc nào đang chạy.">Kiểm tra worker</button>
+          <button data-prompt="Kiểm tra dự án đang chọn, tìm lỗi quan trọng và đề xuất thứ tự xử lý.">Kiểm tra dự án</button>
+          <button data-prompt="Tóm tắt những việc cần làm tiếp theo hôm nay.">Việc tiếp theo</button>
+        </div>
+      </section>
+    </main>
+
+    <section class="controls">
+      <div class="selectors">
+        <select id="project" aria-label="Project">
+          <option value="">Chat thường</option>
+          <option value="nhatkhoa-jpg/Thu-Vien-Kinh-Nikaya">Thu-Vien-Kinh-Nikaya</option>
+          <option value="nhatkhoa-jpg/TrocAutoStudio-Releases">TrocAutoStudio-Releases</option>
+          <option value="nhatkhoa-jpg/TROC-TTS-Gemini-Cloud">TROC-TTS-Gemini-Cloud</option>
+        </select>
+        <select id="mode" aria-label="Chế độ">
+          <option value="chat">Chat</option>
+          <option value="plan">Lập kế hoạch</option>
+        </select>
+        <button id="jobsButton" class="ghost">Công việc</button>
+      </div>
+      <div class="composer">
+        <textarea id="input" rows="1" placeholder="Nhắn cho Trọc AI…" enterkeyhint="send"></textarea>
+        <button id="mic" class="round" aria-label="Nhập bằng giọng nói">🎙</button>
+        <button id="send" class="round send" aria-label="Gửi">↑</button>
+      </div>
+      <div class="hint">Qua WireGuard riêng • Gemini Free • A1 Singapore</div>
+    </section>
+  </div>
+
+  <dialog id="jobsDialog">
+    <div class="dialog-head"><strong>Công việc trên A1</strong><button id="closeJobs" class="icon-btn">×</button></div>
+    <div id="jobsList" class="jobs-list"></div>
+    <form id="jobForm" class="job-form">
+      <select id="jobRepo" required>
+        <option value="nhatkhoa-jpg/Thu-Vien-Kinh-Nikaya">Thu-Vien-Kinh-Nikaya</option>
+        <option value="nhatkhoa-jpg/TrocAutoStudio-Releases">TrocAutoStudio-Releases</option>
+      </select>
+      <textarea id="jobTask" required placeholder="Ví dụ: kiểm tra lỗi build, sửa, test và tạo PR…"></textarea>
+      <button type="submit">Đưa vào hàng đợi</button>
+    </form>
+  </dialog>
+
+  <script type="module" src="/app.js"></script>
+</body>
+</html>
