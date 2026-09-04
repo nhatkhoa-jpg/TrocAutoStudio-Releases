@@ -1,0 +1,93 @@
+name: Oracle A1 Run Command Toggle
+
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/oracle-a1-run-command-toggle.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  toggle:
+    runs-on: ubuntu-latest
+    timeout-minutes: 18
+    env:
+      OCI_CONFIG: ${{ secrets.OCI_CONFIG }}
+      OCI_PRIVATE_KEY: ${{ secrets.OCI_PRIVATE_KEY }}
+      EXPECTED_REGION: ap-singapore-2
+      INSTANCE_NAME: troc-cloud-codex
+    steps:
+      - name: Validate A1 and recycle only Run Command plugin
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python -m pip install --disable-pip-version-check --quiet oci-cli
+          mkdir -p "$HOME/.oci"
+          printf '%s\n' "$OCI_PRIVATE_KEY" > "$HOME/.oci/key.pem"; chmod 600 "$HOME/.oci/key.pem"
+          printf '%s\n' "$OCI_CONFIG" > "$HOME/.oci/config"
+          if grep -q '^key_file=' "$HOME/.oci/config"; then sed -i "s#^key_file=.*#key_file=$HOME/.oci/key.pem#" "$HOME/.oci/config"; else echo "key_file=$HOME/.oci/key.pem" >> "$HOME/.oci/config"; fi
+          chmod 600 "$HOME/.oci/config"
+          trap 'rm -f "$HOME/.oci/key.pem" "$HOME/.oci/config" /tmp/agent-disable.json /tmp/agent-enable.json' EXIT
+          export SUPPRESS_LABEL_WARNING=True OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING=True
+          T="$(awk -F= '/^tenancy=/{gsub(/[[:space:]]/,"",$2);print $2;exit}' "$HOME/.oci/config")"
+          R="$(awk -F= '/^region=/{gsub(/[[:space:]]/,"",$2);print $2;exit}' "$HOME/.oci/config")"; test "$R" = "$EXPECTED_REGION"
+          J="$(oci compute instance list --compartment-id "$T" --region "$R" --display-name "$INSTANCE_NAME" --all | jq -c '[.data[]|select(."lifecycle-state"=="RUNNING")]|sort_by(."time-created")|last')"; test "$J" != null
+          ID="$(jq -r '.id' <<<"$J")"; SHAPE="$(jq -r '.shape' <<<"$J")"; CPU="$(jq -r '."shape-config".ocpus' <<<"$J")"; RAM="$(jq -r '."shape-config"."memory-in-gbs"' <<<"$J")"
+          test "$SHAPE" = 'VM.Standard.A1.Flex'; awk -v v="$CPU" 'BEGIN{exit !(v<=2)}'; awk -v v="$RAM" 'BEGIN{exit !(v<=12)}'
+          AD="$(jq -r '."availability-domain"' <<<"$J")"; BV="$(oci compute boot-volume-attachment list --availability-domain "$AD" --compartment-id "$T" --instance-id "$ID" --region "$R" --all | jq -r '.data[0]."boot-volume-id"')"; SIZE="$(oci bv boot-volume get --boot-volume-id "$BV" --region "$R" --query 'data."size-in-gbs"' --raw-output)"; test "$SIZE" = 50
+          echo "Validated existing A1: $SHAPE cpu=$CPU ram=$RAM boot=$SIZE"
+          cat >/tmp/agent-disable.json <<'JSON'
+          {"areAllPluginsDisabled":false,"isManagementDisabled":false,"isMonitoringDisabled":false,"pluginsConfig":[{"name":"Compute Instance Run Command","desiredState":"DISABLED"}]}
+          JSON
+          cat >/tmp/agent-enable.json <<'JSON'
+          {"areAllPluginsDisabled":false,"isManagementDisabled":false,"isMonitoringDisabled":false,"pluginsConfig":[{"name":"Compute Instance Run Command","desiredState":"ENABLED"}]}
+          JSON
+          oci compute instance update --instance-id "$ID" --region "$R" --agent-config file:///tmp/agent-disable.json --force >/dev/null
+          echo 'Run Command desiredState=DISABLED requested.'
+          SEEN_STOP=0
+          for i in $(seq 1 30); do
+            ST="$(oci instance-agent plugin list --compartment-id "$T" --instanceagent-id "$ID" --region "$R" --all | jq -r '.data[]|select(.name=="Compute Instance Run Command")|.status' | head -1)"
+            echo "disable_check=$i status=${ST:-missing}"
+            if [ "$ST" = STOPPED ]; then SEEN_STOP=1; break; fi
+            sleep 10
+          done
+          echo "plugin_stopped_observed=$SEEN_STOP"
+          oci compute instance update --instance-id "$ID" --region "$R" --agent-config file:///tmp/agent-enable.json --force >/dev/null
+          echo 'Run Command desiredState=ENABLED requested.'
+          for i in $(seq 1 48); do
+            ST="$(oci instance-agent plugin list --compartment-id "$T" --instanceagent-id "$ID" --region "$R" --all | jq -r '.data[]|select(.name=="Compute Instance Run Command")|.status' | head -1)"
+            echo "enable_check=$i status=${ST:-missing}"
+            [ "$ST" = RUNNING ] && break
+            sleep 10
+          done
+          test "$ST" = RUNNING
+          echo "OCI_TENANCY=$T" >> "$GITHUB_ENV"; echo "OCI_REGION=$R" >> "$GITHUB_ENV"; echo "INSTANCE_ID=$ID" >> "$GITHUB_ENV"
+
+      - name: Prove a fresh command is consumed
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          CMD="$(oci instance-agent command create --region "$OCI_REGION" --compartment-id "$OCI_TENANCY" --target '{"instanceId":"'"$INSTANCE_ID"'"}' --content '{"source":{"sourceType":"TEXT","text":"set -eu; echo GUEST_OK_AFTER_TOGGLE; systemctl is-active oracle-cloud-agent 2>/dev/null || true"}}' --timeout-in-seconds 120 --display-name 'troc-a1-after-plugin-toggle' --query 'data.id' --raw-output)"
+          STATE=''; EXEC=''
+          for i in $(seq 1 36); do
+            EXEC="$(oci instance-agent command-execution get --command-id "$CMD" --instance-id "$INSTANCE_ID" --region "$OCI_REGION" 2>/dev/null || true)"
+            STATE="$(jq -r '.data."lifecycle-state" // empty' <<<"$EXEC" 2>/dev/null || true)"
+            echo "probe_check=$i state=${STATE:-unknown}"
+            case "$STATE" in SUCCEEDED|FAILED|CANCELED|TIMED_OUT) break;; esac
+            sleep 5
+          done
+          OUT="$(jq -r '.data.content.text // .data.content.message // empty' <<<"$EXEC" 2>/dev/null || true)"
+          printf '%s\n' "$OUT" | sed -E 's/((token|secret|key)[=:])[[:graph:]]+/\1[REDACTED]/Ig'
+          test "$STATE" = SUCCEEDED
+          grep -q 'GUEST_OK_AFTER_TOGGLE' <<<"$OUT"
+
+      - name: Dispatch private stack deployment
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          gh workflow run oracle-a1-private-stack-deploy.yml --repo nhatkhoa-jpg/TrocAutoStudio-Releases --ref main
+          echo 'PRIVATE_STACK_DEPLOY_DISPATCHED=1'
