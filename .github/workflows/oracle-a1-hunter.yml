@@ -24,6 +24,10 @@ jobs:
       INSTANCE_NAME: troc-cloud-codex
       VCN_NAME: troc-codex-vcn
       SUBNET_NAME: troc-codex-hunter-subnet
+      A1_SHAPE: VM.Standard.A1.Flex
+      A1_MAX_OCPUS: '2'
+      A1_MAX_MEMORY_GB: '12'
+      A1_BOOT_VOLUME_GB: '50'
 
     steps:
       - name: Check required secrets
@@ -91,6 +95,16 @@ jobs:
           set -u
           COMPARTMENT_ID="$OCI_TENANCY_OCID"
 
+          # PAYG safety guard: this workflow may only create the intended Always-Free-size A1 VM.
+          if [ "$A1_SHAPE" != "VM.Standard.A1.Flex" ] || \
+             [ "$A1_MAX_OCPUS" != "2" ] || \
+             [ "$A1_MAX_MEMORY_GB" != "12" ] || \
+             [ "$A1_BOOT_VOLUME_GB" != "50" ]; then
+            echo "::error::PAYG safety constants were changed. Refusing to launch any OCI instance."
+            echo "success=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
           active_instance() {
             oci compute instance list \
               --compartment-id "$COMPARTMENT_ID" \
@@ -106,6 +120,18 @@ jobs:
             echo "Instance already exists: $existing ($state)"
             echo "success=true" >> "$GITHUB_OUTPUT"
             echo "instance_id=$existing" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Refuse to stack another A1 instance in the same compartment. This prevents an
+          # accidental PAYG launch from exceeding the intended 2 OCPU / 12 GB envelope.
+          EXISTING_A1_COUNT="$(oci compute instance list \
+            --compartment-id "$COMPARTMENT_ID" \
+            --all 2>/dev/null |
+            jq --arg shape "$A1_SHAPE" '[.data[] | select(.shape == $shape and ."lifecycle-state" != "TERMINATED")] | length' 2>/dev/null || echo 0)"
+          if [ "${EXISTING_A1_COUNT:-0}" -gt 0 ]; then
+            echo "::warning::Another non-terminated $A1_SHAPE instance already exists in this compartment. Refusing to create a second A1 instance under PAYG safety mode."
+            echo "success=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
@@ -209,7 +235,7 @@ jobs:
             --compartment-id "$COMPARTMENT_ID" \
             --operating-system "Canonical Ubuntu" \
             --operating-system-version "24.04" \
-            --shape "VM.Standard.A1.Flex" \
+            --shape "$A1_SHAPE" \
             --sort-by TIMECREATED \
             --sort-order DESC \
             --limit 1 \
@@ -228,17 +254,24 @@ jobs:
             local ocpus="$1"
             local memory="$2"
             local cfg output rc instance_id
+
+            if [ "$ocpus" -gt "$A1_MAX_OCPUS" ] || [ "$memory" -gt "$A1_MAX_MEMORY_GB" ]; then
+              echo "::error::Refusing launch outside PAYG safety envelope: ${ocpus} OCPU / ${memory} GB"
+              return 1
+            fi
+
             cfg="$(jq -cn --argjson c "$ocpus" --argjson m "$memory" '{ocpus:$c,memoryInGBs:$m}')"
-            echo "Trying A1: ${ocpus} OCPU / ${memory} GB"
+            echo "Trying A1: ${ocpus} OCPU / ${memory} GB / ${A1_BOOT_VOLUME_GB} GB boot"
 
             set +e
             output="$(oci compute instance launch \
               --compartment-id "$COMPARTMENT_ID" \
               --availability-domain "$AD" \
               --display-name "$INSTANCE_NAME" \
-              --shape "VM.Standard.A1.Flex" \
+              --shape "$A1_SHAPE" \
               --shape-config "$cfg" \
               --image-id "$IMAGE_ID" \
+              --boot-volume-size-in-gbs "$A1_BOOT_VOLUME_GB" \
               --subnet-id "$SUBNET_ID" \
               --assign-public-ip false \
               --metadata "$METADATA" 2>&1)"
@@ -275,6 +308,7 @@ jobs:
             echo ""
             echo "No A1 capacity acquired this run."
             echo "Next automatic attempt: about 15 minutes."
+            echo "PAYG safety envelope: max 2 OCPU / 12 GB RAM / 50 GB boot volume; no paid-shape fallback."
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Record success
@@ -289,6 +323,7 @@ jobs:
             echo ""
             echo "- Instance: \`$INSTANCE_ID\`"
             echo "- Shape: \`VM.Standard.A1.Flex\`"
+            echo "- PAYG safety max: \`2 OCPU / 12 GB RAM / 50 GB boot\`"
             echo "- SSH user: \`ubuntu\`"
             echo "- Public IP: not assigned yet (intentional for robust capacity hunting)"
           } >> "$GITHUB_STEP_SUMMARY"
