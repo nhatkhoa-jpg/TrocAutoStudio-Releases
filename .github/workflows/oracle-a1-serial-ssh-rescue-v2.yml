@@ -60,32 +60,39 @@ jobs:
           cleanup_console(){ oci compute instance-console-connection delete --instance-console-connection-id "$CCID" --region "$R" --force >/dev/null 2>&1 || true; }
           trap cleanup_console EXIT
           cat >/tmp/rescue.exp <<'EXP'
-          set timeout 220
+          set timeout 260
           log_user 1
           spawn /tmp/connect-console.sh
-          after 3000
-          send "\r"
-          exec bash -lc "oci compute instance action --instance-id '$env(ID)' --region '$env(R)' --action SOFTRESET >/dev/null"
-
-          # First ESC reaches the UEFI boot manager on this Ampere A1.
-          for {set i 0} {$i < 18} {incr i} { after 500; send "\033" }
           expect {
-            -re {Please select boot device:} { puts "UEFI_BOOT_MANAGER_OK" }
-            timeout { puts "RESCUE_FAIL_NO_BOOT_MANAGER"; exit 31 }
+            -re {login:} { puts "SERIAL_LOGIN_READY" }
+            timeout { puts "RESCUE_FAIL_NO_LOGIN_BEFORE_RESET"; exit 30 }
           }
-          # Ubuntu is already highlighted in the observed console. Enter it.
-          send "\r"
-          # Immediately interrupt hidden GRUB autoboot.
-          for {set i 0} {$i < 16} {incr i} { after 180; send "\033" }
-          expect {
-            -re {GNU GRUB|Advanced options for Ubuntu|Ubuntu} { puts "GRUB_MENU_OK" }
-            timeout { puts "RESCUE_FAIL_NO_GRUB_AFTER_UBUNTU"; exit 32 }
+          exec bash -lc "oci compute instance action --instance-id '$env(ID)' --region '$env(R)' --action SOFTRESET >/dev/null 2>&1 &"
+          set boot 0
+          set grub 0
+          for {set i 0} {$i < 180} {incr i} {
+            send "\033"
+            expect -timeout 0.12 {
+              -re {Please select boot device:|Boot Manager|Boot Device} { set boot 1; puts "UEFI_BOOT_MANAGER_OK"; break }
+              -re {GNU GRUB|Advanced options for Ubuntu} { set grub 1; puts "GRUB_MENU_OK_DIRECT"; break }
+              timeout {}
+            }
           }
+          if {$boot == 0 && $grub == 0} { puts "RESCUE_FAIL_NO_UEFI_OR_GRUB"; exit 31 }
+          if {$boot == 1} {
+            send "\r"
+            for {set i 0} {$i < 100} {incr i} {
+              send "\033"
+              expect -timeout 0.12 {
+                -re {GNU GRUB|Advanced options for Ubuntu|Ubuntu} { set grub 1; puts "GRUB_MENU_OK"; break }
+                timeout {}
+              }
+            }
+          }
+          if {$grub == 0} { puts "RESCUE_FAIL_NO_GRUB_AFTER_UBUNTU"; exit 32 }
           after 400
           send "e"
           after 900
-
-          # Walk editor lines with Ctrl+n. Terminal redraw exposes the current kernel line.
           set found 0
           for {set i 0} {$i < 22} {incr i} {
             expect -timeout 1 {
@@ -174,32 +181,8 @@ jobs:
           KEY="$(sed -n 's/^GEMINI_API_KEY=//p' /tmp/gemini.env)"; test -n "$KEY"
           printf 'GEMINI_API_KEY=%s\nTROC_AI_MODEL=gemini-2.5-flash-lite\nTROC_AI_HOST=10.77.0.1\nTROC_AI_PORT=8787\nTROC_AI_STATE_DIR=/var/lib/troc-ai\nTROC_AI_QUEUE_DIR=/srv/troc-work/queue\n' "$KEY" >/etc/troc-ai/env
           chmod 600 /etc/troc-ai/env; rm -f /tmp/gemini.env
-          if [ ! -s /opt/troc-ai/server.mjs ]; then
-            command -v node >/dev/null 2>&1 || { curl -fsSL https://deb.nodesource.com/setup_22.x | bash -; apt-get update -y; apt-get install -y nodejs; }
-            tmp="$(mktemp -d)"; curl -fsSL --retry 4 https://github.com/nhatkhoa-jpg/TrocAutoStudio-Releases/archive/refs/heads/work/troc-ai-mobile-v1.tar.gz | tar -xz -C "$tmp"; src="$(find "$tmp" -type d -name troc-ai | head -1)"; test -n "$src"; rm -rf /opt/troc-ai; cp -a "$src" /opt/troc-ai; rm -rf "$tmp"
-          fi
+          test -s /opt/troc-ai/server.mjs
           command -v node >/dev/null 2>&1; node --check /opt/troc-ai/server.mjs
-          cat >/etc/systemd/system/troc-ai.service <<'UNIT'
-          [Unit]
-          Description=Trọc AI private mobile gateway
-          After=network-online.target wg-quick@wg0.service
-          Wants=network-online.target wg-quick@wg0.service
-          [Service]
-          Type=simple
-          User=root
-          WorkingDirectory=/opt/troc-ai
-          EnvironmentFile=/etc/troc-ai/env
-          ExecStart=/usr/bin/node /opt/troc-ai/server.mjs
-          Restart=always
-          RestartSec=3
-          NoNewPrivileges=true
-          PrivateTmp=true
-          ProtectSystem=strict
-          ReadWritePaths=/var/lib/troc-ai /srv/troc-work
-          ProtectHome=true
-          [Install]
-          WantedBy=multi-user.target
-          UNIT
           systemctl daemon-reload; systemctl enable troc-ai.service >/dev/null; systemctl restart troc-ai.service
           for i in $(seq 1 30); do curl -fsS --max-time 5 http://10.77.0.1:8787/api/health >/tmp/h.json && break || sleep 2; done
           jq -e '.ok==true and .gemini_ready==true' /tmp/h.json >/dev/null
