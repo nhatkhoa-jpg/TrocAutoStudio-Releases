@@ -1,9 +1,10 @@
 name: GCP Cloud Codex Bootstrap
 
+# Manual recovery/bootstrap only. The old 5-minute schedule was removed because
+# the configured Workload Identity Provider currently does not exist/is disabled,
+# causing repeated invalid_target failures and wasting Actions runs.
 on:
   workflow_dispatch:
-  schedule:
-    - cron: '*/5 * * * *'
 
 permissions:
   contents: read
