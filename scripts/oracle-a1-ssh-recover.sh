@@ -137,7 +137,7 @@ umask 077
 printf 'GEMINI_API_KEY=%s\n' "$GEMINI_API_KEY" > /tmp/gemini.env
 printf 'PHONE_WG_PUBLIC_KEY=%q\nAPP_SOURCE_REF=%q\nTROC_AI_MODEL=%q\n' "$PHONE_WG_PUBLIC_KEY" "$APP_SOURCE_REF" "$TROC_AI_MODEL" > /tmp/troc-bootstrap.env
 scp "${SSH_OPTS[@]}" /tmp/gemini.env /tmp/troc-bootstrap.env "$GUEST_SCRIPT" ubuntu@"$PUBLIC_IP":/tmp/
-ssh "${SSH_OPTS[@]}" ubuntu@"$PUBLIC_IP" "sudo mv /tmp/$(basename "$GUEST_SCRIPT") /tmp/oracle-a1-ssh-bootstrap-guest.sh && sudo chmod 700 /tmp/oracle-a1-ssh-bootstrap-guest.sh && sudo bash /tmp/oracle-a1-ssh-bootstrap-guest.sh"
+ssh "${SSH_OPTS[@]}" ubuntu@"$PUBLIC_IP" "sudo chmod 700 /tmp/$(basename "$GUEST_SCRIPT") && sudo bash /tmp/$(basename "$GUEST_SCRIPT")"
 
 SERVER_PUB="$(ssh "${SSH_OPTS[@]}" ubuntu@"$PUBLIC_IP" 'sudo cat /etc/wireguard/server.pub' | tr -d '\r\n')"
 test -n "$SERVER_PUB"
