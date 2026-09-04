@@ -1,0 +1,347 @@
+name: Oracle A1 Rebuild Public
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/oracle-a1-rebuild-public.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: oracle-a1-rebuild-public
+  cancel-in-progress: false
+
+jobs:
+  rebuild:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      OCI_CONFIG: ${{ secrets.OCI_CONFIG }}
+      OCI_PRIVATE_KEY: ${{ secrets.OCI_PRIVATE_KEY }}
+      OCI_SSH_PUBLIC_KEY: ${{ secrets.OCI_SSH_PUBLIC_KEY }}
+      INSTANCE_NAME: troc-cloud-codex
+      VCN_NAME: troc-codex-vcn
+      PUBLIC_SUBNET_NAME: troc-codex-public-subnet
+      PUBLIC_SUBNET_CIDR: 10.42.1.0/24
+      PUBLIC_RT_NAME: troc-codex-public-rt
+      PUBLIC_SL_NAME: troc-codex-public-sl
+      IGW_NAME: troc-codex-igw
+      A1_SHAPE: VM.Standard.A1.Flex
+      A1_OCPUS: '2'
+      A1_MEMORY_GB: '12'
+      BOOT_GB: '50'
+      WG_PORT: '51820'
+
+    steps:
+      - name: Preflight
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$OCI_CONFIG"
+          test -n "$OCI_PRIVATE_KEY"
+          test -n "$OCI_SSH_PUBLIC_KEY"
+          test "$A1_SHAPE" = 'VM.Standard.A1.Flex'
+          test "$A1_OCPUS" = '2'
+          test "$A1_MEMORY_GB" = '12'
+          test "$BOOT_GB" = '50'
+
+      - name: Install and configure OCI CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check --quiet oci-cli
+          mkdir -p "$HOME/.oci"
+          printf '%s\n' "$OCI_PRIVATE_KEY" > "$HOME/.oci/oci_api_key.pem"
+          chmod 600 "$HOME/.oci/oci_api_key.pem"
+          printf '%s\n' "$OCI_CONFIG" > "$HOME/.oci/config"
+          if grep -q '^key_file=' "$HOME/.oci/config"; then
+            sed -i "s#^key_file=.*#key_file=$HOME/.oci/oci_api_key.pem#" "$HOME/.oci/config"
+          else
+            echo "key_file=$HOME/.oci/oci_api_key.pem" >> "$HOME/.oci/config"
+          fi
+          chmod 600 "$HOME/.oci/config"
+          TENANCY_ID="$(awk -F= '/^tenancy=/{gsub(/[[:space:]]/,"",$2); print $2; exit}' "$HOME/.oci/config")"
+          REGION="$(awk -F= '/^region=/{gsub(/[[:space:]]/,"",$2); print $2; exit}' "$HOME/.oci/config")"
+          test -n "$TENANCY_ID"
+          if [ -z "$REGION" ]; then
+            REGION='ap-singapore-2'
+            echo "region=$REGION" >> "$HOME/.oci/config"
+          fi
+          echo "OCI_TENANCY_OCID=$TENANCY_ID" >> "$GITHUB_ENV"
+          echo "OCI_REGION=$REGION" >> "$GITHUB_ENV"
+          oci iam region-subscription list --tenancy-id "$TENANCY_ID" >/dev/null
+          echo "OCI ready in $REGION"
+
+      - name: Prepare VPN-ready public subnet
+        shell: bash
+        run: |
+          set -euo pipefail
+          VCN_ID="$(oci network vcn list --compartment-id "$OCI_TENANCY_OCID" \
+            --display-name "$VCN_NAME" --all | \
+            jq -r '.data[] | select(."lifecycle-state"=="AVAILABLE") | .id' | head -n1)"
+          test -n "$VCN_ID"
+
+          IGW_ID="$(oci network internet-gateway list --compartment-id "$OCI_TENANCY_OCID" \
+            --vcn-id "$VCN_ID" --all | jq -r --arg n "$IGW_NAME" \
+            '.data[] | select(."display-name"==$n and ."lifecycle-state"=="AVAILABLE") | .id' | head -n1)"
+          if [ -z "$IGW_ID" ]; then
+            IGW_ID="$(oci network internet-gateway create --compartment-id "$OCI_TENANCY_OCID" \
+              --vcn-id "$VCN_ID" --is-enabled true --display-name "$IGW_NAME" \
+              --wait-for-state AVAILABLE --query 'data.id' --raw-output)"
+          else
+            oci network internet-gateway update --ig-id "$IGW_ID" --is-enabled true --force >/dev/null
+          fi
+
+          ROUTES="$(jq -cn --arg igw "$IGW_ID" '[{cidrBlock:"0.0.0.0/0",networkEntityId:$igw}]')"
+          RT_ID="$(oci network route-table list --compartment-id "$OCI_TENANCY_OCID" \
+            --vcn-id "$VCN_ID" --all | jq -r --arg n "$PUBLIC_RT_NAME" \
+            '.data[] | select(."display-name"==$n and ."lifecycle-state"=="AVAILABLE") | .id' | head -n1)"
+          if [ -z "$RT_ID" ]; then
+            RT_ID="$(oci network route-table create --compartment-id "$OCI_TENANCY_OCID" \
+              --vcn-id "$VCN_ID" --display-name "$PUBLIC_RT_NAME" --route-rules "$ROUTES" \
+              --wait-for-state AVAILABLE --query 'data.id' --raw-output)"
+          else
+            oci network route-table update --rt-id "$RT_ID" --route-rules "$ROUTES" --force >/dev/null
+          fi
+
+          INGRESS="$(jq -cn --argjson p "$WG_PORT" '[{source:"0.0.0.0/0",protocol:"17",isStateless:false,udpOptions:{destinationPortRange:{min:$p,max:$p}}}]')"
+          EGRESS='[{"destination":"0.0.0.0/0","protocol":"all","isStateless":false}]'
+          SL_ID="$(oci network security-list list --compartment-id "$OCI_TENANCY_OCID" \
+            --vcn-id "$VCN_ID" --all | jq -r --arg n "$PUBLIC_SL_NAME" \
+            '.data[] | select(."display-name"==$n and ."lifecycle-state"=="AVAILABLE") | .id' | head -n1)"
+          if [ -z "$SL_ID" ]; then
+            SL_ID="$(oci network security-list create --compartment-id "$OCI_TENANCY_OCID" \
+              --vcn-id "$VCN_ID" --display-name "$PUBLIC_SL_NAME" \
+              --ingress-security-rules "$INGRESS" --egress-security-rules "$EGRESS" \
+              --wait-for-state AVAILABLE --query 'data.id' --raw-output)"
+          else
+            oci network security-list update --security-list-id "$SL_ID" \
+              --ingress-security-rules "$INGRESS" --egress-security-rules "$EGRESS" --force >/dev/null
+          fi
+
+          SL_IDS="$(jq -cn --arg id "$SL_ID" '[$id]')"
+          SUBNET_ID="$(oci network subnet list --compartment-id "$OCI_TENANCY_OCID" \
+            --vcn-id "$VCN_ID" --all | jq -r --arg n "$PUBLIC_SUBNET_NAME" \
+            '.data[] | select(."display-name"==$n and ."lifecycle-state"=="AVAILABLE") | .id' | head -n1)"
+          if [ -z "$SUBNET_ID" ]; then
+            SUBNET_ID="$(oci network subnet create --compartment-id "$OCI_TENANCY_OCID" \
+              --vcn-id "$VCN_ID" --cidr-block "$PUBLIC_SUBNET_CIDR" \
+              --display-name "$PUBLIC_SUBNET_NAME" --route-table-id "$RT_ID" \
+              --security-list-ids "$SL_IDS" --prohibit-internet-ingress false \
+              --wait-for-state AVAILABLE --query 'data.id' --raw-output)"
+          else
+            # Public/private is immutable after subnet creation. Only keep route/security current.
+            oci network subnet update --subnet-id "$SUBNET_ID" \
+              --route-table-id "$RT_ID" --security-list-ids "$SL_IDS" --force >/dev/null
+            IS_PRIVATE="$(oci network subnet get --subnet-id "$SUBNET_ID" \
+              --query 'data."prohibit-public-ip-on-vnic"' --raw-output)"
+            if [ "$IS_PRIVATE" = 'true' ]; then
+              echo '::error::Existing VPN subnet is private. Refusing unsafe in-place conversion.'
+              exit 1
+            fi
+          fi
+          echo "PUBLIC_SUBNET_ID=$SUBNET_ID" >> "$GITHUB_ENV"
+          echo "Public subnet ready: $SUBNET_ID"
+
+      - name: Replace pristine private A1 with public A1
+        shell: bash
+        run: |
+          set -euo pipefail
+          OLD_JSON="$(oci compute instance list --compartment-id "$OCI_TENANCY_OCID" \
+            --display-name "$INSTANCE_NAME" --all | \
+            jq -c '[.data[] | select(."lifecycle-state" != "TERMINATED")] | sort_by(."time-created") | last')"
+          test "$OLD_JSON" != 'null'
+          OLD_ID="$(jq -r '.id' <<<"$OLD_JSON")"
+          OLD_SHAPE="$(jq -r '.shape' <<<"$OLD_JSON")"
+          OLD_CPU="$(jq -r '."shape-config".ocpus' <<<"$OLD_JSON")"
+          OLD_RAM="$(jq -r '."shape-config"."memory-in-gbs"' <<<"$OLD_JSON")"
+          IMAGE_ID="$(jq -r '."image-id" // empty' <<<"$OLD_JSON")"
+          AD="$(jq -r '."availability-domain"' <<<"$OLD_JSON")"
+          test "$OLD_SHAPE" = "$A1_SHAPE"
+          awk -v v="$OLD_CPU" 'BEGIN {exit !(v<=2)}'
+          awk -v v="$OLD_RAM" 'BEGIN {exit !(v<=12)}'
+          if [ -z "$IMAGE_ID" ]; then
+            IMAGE_ID="$(oci compute image list --compartment-id "$OCI_TENANCY_OCID" \
+              --operating-system 'Canonical Ubuntu' --operating-system-version '24.04' \
+              --shape "$A1_SHAPE" --sort-by TIMECREATED --sort-order DESC --limit 1 \
+              --query 'data[0].id' --raw-output)"
+          fi
+          test -n "$IMAGE_ID" && test "$IMAGE_ID" != 'null'
+
+          echo "Terminating pristine private instance $OLD_ID before replacement (no paid overlap)."
+          oci compute instance terminate --instance-id "$OLD_ID" \
+            --preserve-boot-volume false --force --wait-for-state TERMINATED \
+            --max-wait-seconds 900 >/dev/null
+
+          META="$(jq -cn --arg key "$OCI_SSH_PUBLIC_KEY" '{ssh_authorized_keys:$key}')"
+          CFG="$(jq -cn --argjson c "$A1_OCPUS" --argjson m "$A1_MEMORY_GB" '{ocpus:$c,memoryInGBs:$m}')"
+
+          INSTANCE_ID=''
+          for attempt in 1 2 3 4 5; do
+            echo "Launch attempt $attempt: 2 OCPU / 12 GB / 50 GB"
+            set +e
+            OUT="$(oci compute instance launch --compartment-id "$OCI_TENANCY_OCID" \
+              --availability-domain "$AD" --display-name "$INSTANCE_NAME" \
+              --shape "$A1_SHAPE" --shape-config "$CFG" --image-id "$IMAGE_ID" \
+              --boot-volume-size-in-gbs "$BOOT_GB" --subnet-id "$PUBLIC_SUBNET_ID" \
+              --assign-public-ip true --metadata "$META" 2>&1)"
+            RC=$?
+            set -e
+            if [ "$RC" -eq 0 ]; then
+              INSTANCE_ID="$(jq -r '.data.id // empty' <<<"$OUT" 2>/dev/null)"
+              break
+            fi
+            printf '%s\n' "$OUT"
+            sleep 20
+          done
+          if [ -z "$INSTANCE_ID" ]; then
+            echo '::error::Could not reacquire A1 after five PAYG attempts. No paid shape was used.'
+            exit 1
+          fi
+
+          oci compute instance get --instance-id "$INSTANCE_ID" --wait-for-state RUNNING \
+            --max-wait-seconds 900 >/dev/null
+          VNIC_ID="$(oci compute vnic-attachment list --compartment-id "$OCI_TENANCY_OCID" \
+            --instance-id "$INSTANCE_ID" --all --query 'data[0]."vnic-id"' --raw-output)"
+          PUBLIC_IP=''
+          for i in $(seq 1 30); do
+            PUBLIC_IP="$(oci network vnic get --vnic-id "$VNIC_ID" --query 'data."public-ip"' --raw-output 2>/dev/null || true)"
+            if [ -n "$PUBLIC_IP" ] && [ "$PUBLIC_IP" != 'null' ]; then break; fi
+            sleep 5
+          done
+          test -n "$PUBLIC_IP" && test "$PUBLIC_IP" != 'null'
+          echo "INSTANCE_ID=$INSTANCE_ID" >> "$GITHUB_ENV"
+          echo "OCI_PUBLIC_IP=$PUBLIC_IP" >> "$GITHUB_ENV"
+          echo "Public A1 running: $PUBLIC_IP"
+
+      - name: Wait for Run Command plugin
+        shell: bash
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 45); do
+            PLUGINS="$(oci instance-agent plugin list --compartment-id "$OCI_TENANCY_OCID" \
+              --instanceagent-id "$INSTANCE_ID" --all 2>/dev/null || true)"
+            STATUS="$(jq -r '[.data[]? | select((.name|ascii_downcase|contains("run")) and (.name|ascii_downcase|contains("command")))][0].status // empty' <<<"$PLUGINS" 2>/dev/null || true)"
+            echo "Run Command plugin: ${STATUS:-waiting}"
+            if [ "$STATUS" = 'RUNNING' ]; then exit 0; fi
+            sleep 10
+          done
+          echo '::error::Oracle Cloud Agent Run Command plugin did not become ready.'
+          exit 1
+
+      - name: Bootstrap Ubuntu and WireGuard
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat >/tmp/bootstrap.sh <<'SCRIPT'
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -y
+          apt-get install -y --no-install-recommends \
+            ca-certificates curl git jq unzip zip rsync tmux htop ripgrep \
+            build-essential python3 python3-pip python3-venv openjdk-17-jdk-headless \
+            docker.io wireguard-tools iptables iproute2 gh
+          systemctl enable --now docker
+          usermod -aG docker ubuntu || true
+
+          if ! command -v node >/dev/null 2>&1 || [ "$(node -p 'Number(process.versions.node.split(".")[0])' 2>/dev/null || echo 0)" -lt 22 ]; then
+            curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
+            apt-get install -y nodejs
+          fi
+          npm install -g npm@latest @google/gemini-cli @openai/codex
+
+          if ! swapon --show=NAME --noheadings | grep -q '^/swapfile$'; then
+            [ -f /swapfile ] || { fallocate -l 4G /swapfile || dd if=/dev/zero of=/swapfile bs=1M count=4096; }
+            chmod 600 /swapfile
+            mkswap /swapfile >/dev/null 2>&1 || true
+            swapon /swapfile
+          fi
+          grep -q '^/swapfile ' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
+
+          cat >/etc/sysctl.d/99-troc-vpn.conf <<'SYSCTL'
+          net.ipv4.ip_forward=1
+          net.ipv4.conf.all.src_valid_mark=1
+          SYSCTL
+          sysctl --system >/dev/null
+
+          install -d -m 700 /etc/wireguard
+          if [ ! -s /etc/wireguard/server.key ]; then
+            umask 077
+            wg genkey | tee /etc/wireguard/server.key | wg pubkey > /etc/wireguard/server.pub
+          fi
+          WAN_IF="$(ip route show default | awk '{print $5; exit}')"
+          SERVER_KEY="$(cat /etc/wireguard/server.key)"
+          cat >/etc/wireguard/wg0.conf <<EOF
+          [Interface]
+          Address = 10.77.0.1/24
+          ListenPort = 51820
+          PrivateKey = ${SERVER_KEY}
+          MTU = 1380
+          PostUp = iptables -A FORWARD -i %i -j ACCEPT; iptables -A FORWARD -o %i -j ACCEPT; iptables -t nat -A POSTROUTING -o ${WAN_IF} -j MASQUERADE
+          PostDown = iptables -D FORWARD -i %i -j ACCEPT; iptables -D FORWARD -o %i -j ACCEPT; iptables -t nat -D POSTROUTING -o ${WAN_IF} -j MASQUERADE
+          EOF
+          chmod 600 /etc/wireguard/wg0.conf /etc/wireguard/server.key
+          systemctl enable --now wg-quick@wg0
+          install -d -o ubuntu -g ubuntu /opt/troc /srv/troc-work
+
+          echo '===TROC_HEALTH_BEGIN==='
+          uname -a
+          echo "CPU=$(nproc)"
+          free -h
+          df -h /
+          echo "NODE=$(node --version)"
+          echo "GEMINI=$(gemini --version 2>/dev/null || true)"
+          echo "CODEX=$(codex --version 2>/dev/null || true)"
+          echo "DOCKER=$(docker --version)"
+          echo "DOCKER_SERVICE=$(systemctl is-active docker)"
+          echo "WG_SERVICE=$(systemctl is-active wg-quick@wg0)"
+          echo "WG_PUBLIC_KEY=$(cat /etc/wireguard/server.pub)"
+          wg show wg0
+          echo '===TROC_HEALTH_END==='
+          SCRIPT
+
+          TEXT="$(cat /tmp/bootstrap.sh)"
+          CONTENT="$(jq -cn --arg text "$TEXT" '{source:{sourceType:"TEXT",text:$text},output:{outputType:"TEXT"},commandString:"/bin/bash"}')"
+          TARGET="$(jq -cn --arg id "$INSTANCE_ID" '{instanceId:$id}')"
+          CMD_ID="$(oci instance-agent command create --compartment-id "$OCI_TENANCY_OCID" \
+            --content "$CONTENT" --target "$TARGET" --timeout-in-seconds 1800 \
+            --display-name 'troc-a1-bootstrap-public' --query 'data.id' --raw-output)"
+
+          FINAL=''
+          EXEC=''
+          for i in $(seq 1 150); do
+            EXEC="$(oci instance-agent command-execution get --command-id "$CMD_ID" \
+              --instance-id "$INSTANCE_ID" 2>/dev/null || true)"
+            FINAL="$(jq -r '.data."lifecycle-state" // empty' <<<"$EXEC" 2>/dev/null || true)"
+            case "$FINAL" in SUCCEEDED|FAILED|TIMED_OUT|CANCELED) break;; esac
+            sleep 10
+          done
+          OUTPUT="$(jq -r '.data.content.text // .data.content.message // empty' <<<"$EXEC" 2>/dev/null || true)"
+          EXIT_CODE="$(jq -r '.data.content."exit-code" // 999' <<<"$EXEC" 2>/dev/null || echo 999)"
+          printf '%s\n' "$OUTPUT"
+          echo "Remote state=$FINAL exit=$EXIT_CODE"
+          if [ "$FINAL" != 'SUCCEEDED' ] || [ "$EXIT_CODE" != '0' ]; then exit 1; fi
+          WG_PUB="$(printf '%s\n' "$OUTPUT" | sed -n 's/^WG_PUBLIC_KEY=//p' | tail -n1)"
+          test -n "$WG_PUB"
+          echo "WG_SERVER_PUBLIC_KEY=$WG_PUB" >> "$GITHUB_ENV"
+
+      - name: Final summary
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo '## Oracle A1 is ready'
+            echo ''
+            echo "- Region: \`$OCI_REGION\`"
+            echo '- Shape: `VM.Standard.A1.Flex`'
+            echo '- Compute: `2 OCPU / 12 GB RAM / 50 GB boot`'
+            echo "- Public IPv4: \`$OCI_PUBLIC_IP\`"
+            echo '- WireGuard: `UDP 51820`, VPN subnet `10.77.0.0/24`, MTU `1380`'
+            echo "- WireGuard server public key: \`$WG_SERVER_PUBLIC_KEY\`"
+            echo '- Installed: Docker, Node 22, Gemini CLI, Codex CLI, GitHub CLI, Python, Java 17'
+            echo '- Swap: `4 GB`'
+            echo '- Public firewall exposes only WireGuard UDP/51820; SSH is not public.'
+            echo '- No paid compute shape and no overlapping second A1 were used.'
+          } >> "$GITHUB_STEP_SUMMARY"
