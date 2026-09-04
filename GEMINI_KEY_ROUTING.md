@@ -1,6 +1,6 @@
 # Gemini Free-Tier Key Routing — durable owner policy
 
-Status: active from 2026-09-05. This repository is release-artifact storage and must not use Gemini at runtime.
+Status: active from 2026-09-05. This repository stores release artifacts **and** contains Oracle A1 / GCP infrastructure and recovery workflows. Never place actual key values in Git, logs, issues, APKs, ZIPs, metadata, screenshots, or downloadable assets.
 
 ## Google AI Studio project pool
 
@@ -16,15 +16,20 @@ Status: active from 2026-09-05. This repository is release-artifact storage and 
 
 All seven projects are intended to remain Free Tier unless the owner explicitly changes that policy.
 
-## This repository
+## This repository's runtime routing
 
-`nhatkhoa-jpg/TrocAutoStudio-Releases` is for release artifacts only. Do not add Gemini runtime calls here and do not embed any Gemini credential into APKs, release ZIPs, metadata, logs, or downloadable assets.
+- APK/release publication itself must not use or embed a Gemini credential.
+- Oracle A1, GCP Cloud Codex, private AI gateway, recovery/bootstrap and other server-side infrastructure workflows in this repository that require Gemini belong to the **CLOUD** workload.
+- New or edited infrastructure workflows must read `GEMINI_API_KEY_CLOUD` and map it to `GEMINI_API_KEY` only inside the authorized server-side job/process when required by existing software.
+- Some older infrastructure workflows may still reference the generic GitHub secret `GEMINI_API_KEY`. During migration, that generic secret is a **compatibility alias only** and must contain the same CLOUD Free-Tier credential as `GEMINI_API_KEY_CLOUD`; it is not an eighth quota pool.
+- Do not migrate Google Cloud Text-to-Speech, OCI credentials, WIF credentials, signing material or other unrelated credentials into Gemini secrets.
 
 ## Shared rules
 
-- Never commit actual secret values.
-- Never round-robin project keys to bypass provider quotas.
-- `RESERVE_01` and `RESERVE_02` are manual reserve capacity only.
-- Never auto-failover Free Tier traffic to Paid Tier.
-- GitHub Actions secrets do not automatically become Vercel/Oracle/Cloudflare runtime variables.
-- Any future agent should read the code repository's `GEMINI_KEY_ROUTING.md` and `AGENTS.md` before changing Gemini integrations.
+1. Never commit actual secret values.
+2. Never round-robin project keys to bypass provider quotas.
+3. `RESERVE_01` and `RESERVE_02` are manual reserve capacity only.
+4. Never auto-failover Free Tier traffic to Paid Tier.
+5. GitHub Actions secrets do not automatically become Oracle/Vercel/Cloudflare runtime variables. A deployment workflow must explicitly inject the assigned secret into the trusted server.
+6. Never inject a central Gemini key into an Android APK, browser bundle, downloadable artifact, or client-visible configuration.
+7. Any future agent must read this file and `AGENTS.md` before changing Gemini/infrastructure integrations.
