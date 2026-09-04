@@ -1,0 +1,21 @@
+name: A1 Recovery Stop
+
+on:
+  push:
+    branches: ['work/a1-recovery-stop-temp-final2']
+    paths:
+      - '.github/workflows/a1-recovery-stop.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: oracle-a1-cloud-init-recover
+  cancel-in-progress: true
+
+jobs:
+  stop:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - run: echo 'Canceled stale Oracle A1 recovery runs before corrected recovery.'
