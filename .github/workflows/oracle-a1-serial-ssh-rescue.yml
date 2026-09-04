@@ -1,0 +1,170 @@
+name: Oracle A1 Serial SSH Rescue
+
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/oracle-a1-serial-ssh-rescue.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  rescue:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    env:
+      OCI_CONFIG: ${{ secrets.OCI_CONFIG }}
+      OCI_PRIVATE_KEY: ${{ secrets.OCI_PRIVATE_KEY }}
+      EXPECTED_REGION: ap-singapore-2
+      INSTANCE_NAME: troc-cloud-codex
+    steps:
+      - name: Inject ephemeral SSH key into existing A1 via serial GRUB
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python -m pip install --disable-pip-version-check --quiet oci-cli
+          sudo apt-get update -qq && sudo apt-get install -y -qq expect >/dev/null
+          mkdir -p "$HOME/.oci"
+          printf '%s\n' "$OCI_PRIVATE_KEY" > "$HOME/.oci/key.pem"; chmod 600 "$HOME/.oci/key.pem"
+          printf '%s\n' "$OCI_CONFIG" > "$HOME/.oci/config"
+          if grep -q '^key_file=' "$HOME/.oci/config"; then sed -i "s#^key_file=.*#key_file=$HOME/.oci/key.pem#" "$HOME/.oci/config"; else echo "key_file=$HOME/.oci/key.pem" >> "$HOME/.oci/config"; fi
+          chmod 600 "$HOME/.oci/config"
+          export SUPPRESS_LABEL_WARNING=True OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING=True
+          T="$(awk -F= '/^tenancy=/{gsub(/[[:space:]]/,"",$2);print $2;exit}' "$HOME/.oci/config")"
+          R="$(awk -F= '/^region=/{gsub(/[[:space:]]/,"",$2);print $2;exit}' "$HOME/.oci/config")"; test "$R" = "$EXPECTED_REGION"
+          J="$(oci compute instance list --compartment-id "$T" --region "$R" --display-name "$INSTANCE_NAME" --all | jq -c '[.data[]|select(."lifecycle-state"=="RUNNING")]|sort_by(."time-created")|last')"; test "$J" != null
+          ID="$(jq -r '.id' <<<"$J")"; test "$(jq -r '.shape' <<<"$J")" = 'VM.Standard.A1.Flex'
+          awk -v v="$(jq -r '."shape-config".ocpus' <<<"$J")" 'BEGIN{exit !(v<=2)}'
+          awk -v v="$(jq -r '."shape-config"."memory-in-gbs"' <<<"$J")" 'BEGIN{exit !(v<=12)}'
+          AD="$(jq -r '."availability-domain"' <<<"$J")"; BV="$(oci compute boot-volume-attachment list --availability-domain "$AD" --compartment-id "$T" --instance-id "$ID" --region "$R" --all | jq -r '.data[0]."boot-volume-id"')"
+          test "$(oci bv boot-volume get --boot-volume-id "$BV" --region "$R" --query 'data."size-in-gbs"' --raw-output)" = 50
+          PUB="$(oci compute instance list-vnics --instance-id "$ID" --region "$R" | jq -r '.data[]|select(."is-primary"==true)|."public-ip"' | head -1)"; test -n "$PUB" && test "$PUB" != null
+          echo "Validated existing bounded A1; current_public_ip=$PUB"
+
+          # Ensure only this serial client exists.
+          mapfile -t CCS < <(oci compute instance-console-connection list --compartment-id "$T" --instance-id "$ID" --region "$R" --all | jq -r '.data[]|select(."lifecycle-state"!="DELETED" and ."lifecycle-state"!="DELETING")|.id')
+          for cc in "${CCS[@]}"; do [ -n "$cc" ] && oci compute instance-console-connection delete --instance-console-connection-id "$cc" --region "$R" --force >/dev/null 2>&1 || true; done
+          sleep 4
+          ssh-keygen -q -t rsa -b 2048 -N '' -f /tmp/console_rsa
+          ssh-keygen -q -t ed25519 -N '' -C "troc-gh-rescue-${GITHUB_RUN_ID}" -f /tmp/a1_rescue
+          RESCUE_PUB="$(cat /tmp/a1_rescue.pub)"
+          printf '%s' "$RESCUE_PUB" | base64 -w0 > /tmp/rescue_pub.b64
+          CCJSON="$(oci compute instance-console-connection create --instance-id "$ID" --region "$R" --ssh-public-key-file /tmp/console_rsa.pub --wait-for-state ACTIVE --wait-interval-seconds 3)"
+          CCID="$(jq -r '.data.id' <<<"$CCJSON")"; test -n "$CCID" && test "$CCID" != null
+          cleanup_console(){ oci compute instance-console-connection delete --instance-console-connection-id "$CCID" --region "$R" --force >/dev/null 2>&1 || true; }
+          trap cleanup_console EXIT
+          cat >/tmp/connect-console.sh <<EOF
+          #!/usr/bin/env bash
+          exec ssh -tt -i /tmp/console_rsa -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            -o "ProxyCommand=ssh -i /tmp/console_rsa -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -W %h:%p -p 443 ${CCID}@instance-console.${R}.oci.oraclecloud.com" ${ID}
+          EOF
+          chmod 700 /tmp/connect-console.sh
+          export ID R RESCUE_PUB
+
+          # Connect first, then soft-reset the SAME instance and interrupt GRUB.
+          cat >/tmp/rescue.exp <<'EXP'
+          set timeout 180
+          log_user 1
+          spawn /tmp/connect-console.sh
+          after 3500
+          send "\r"
+          # Trigger only SOFTRESET on the validated existing instance.
+          exec bash -lc "oci compute instance action --instance-id '$env(ID)' --region '$env(R)' --action SOFTRESET >/dev/null"
+          # Escape repeatedly during firmware/GRUB window so autoboot stops.
+          for {set i 0} {$i < 32} {incr i} {
+            after 450
+            send "\033"
+          }
+          expect {
+            -re {GNU GRUB|Ubuntu|Advanced options} {
+              after 800
+              # Select default Ubuntu entry and enter editor.
+              send "e"
+            }
+            timeout { puts "RESCUE_FAIL_NO_GRUB"; exit 21 }
+          }
+          # Wait for editor text. Search visually for linux line by using Ctrl+f is not portable;
+          # use repeated Down and inspect screen after each. We stop when line starts with linux.
+          set found 0
+          for {set i 0} {$i < 18} {incr i} {
+            after 250
+            send "\033\[B"
+            expect -timeout 1 {
+              -re {linux[[:space:]]+/boot/|linux[[:space:]]+/} { set found 1; break }
+              timeout {}
+            }
+          }
+          if {$found == 0} {
+            # Ubuntu entries commonly place linux near the end; use End then move up once.
+            send "\033\[F"
+            after 300
+            send "\033\[A"
+          }
+          # Move to end of current kernel line and append init shell.
+          send "\005"
+          send " init=/bin/bash"
+          after 400
+          send "\030"
+          expect {
+            -re {root@|bash-[0-9]|/#|\(initramfs\)} { }
+            timeout { puts "RESCUE_FAIL_NO_ROOT_SHELL"; exit 22 }
+          }
+          send "/bin/mount -o remount,rw /\r"
+          expect -re {#|/}
+          after 400
+          # Add only tagged ephemeral key. Public key is safe but do not echo it in logs.
+          set key $env(RESCUE_PUB)
+          send "mkdir -p /home/ubuntu/.ssh; chmod 700 /home/ubuntu/.ssh; touch /home/ubuntu/.ssh/authorized_keys; grep -Fq 'troc-gh-rescue-' /home/ubuntu/.ssh/authorized_keys || echo '$key' >> /home/ubuntu/.ssh/authorized_keys; chown -R ubuntu:ubuntu /home/ubuntu/.ssh; chmod 600 /home/ubuntu/.ssh/authorized_keys; sync; echo RESCUE_KEY_INSTALLED\r"
+          expect {
+            -re {RESCUE_KEY_INSTALLED} { }
+            timeout { puts "RESCUE_FAIL_KEY_WRITE"; exit 23 }
+          }
+          after 400
+          send "exec /sbin/reboot -f\r"
+          after 2500
+          send "~."
+          expect eof
+          EXP
+          expect /tmp/rescue.exp
+          cleanup_console
+          trap - EXIT
+
+          # Wait for normal boot. Public SSH is still closed here; only prove OCI RUNNING.
+          for i in $(seq 1 60); do
+            ST="$(oci compute instance get --instance-id "$ID" --region "$R" --query 'data."lifecycle-state"' --raw-output 2>/dev/null || true)"
+            [ "$ST" = RUNNING ] && break
+            sleep 4
+          done
+          test "$ST" = RUNNING
+          sleep 25
+          PUB2="$(oci compute instance list-vnics --instance-id "$ID" --region "$R" | jq -r '.data[]|select(."is-primary"==true)|."public-ip"' | head -1)"
+          echo "A1 back to normal boot; current_public_ip=$PUB2"
+          # Preserve rescue private key only inside this job for next step; never print it.
+          echo "INSTANCE_ID=$ID" >> "$GITHUB_ENV"; echo "OCI_TENANCY=$T" >> "$GITHUB_ENV"; echo "OCI_REGION=$R" >> "$GITHUB_ENV"; echo "CURRENT_PUBLIC_IP=$PUB2" >> "$GITHUB_ENV"
+
+      - name: Prove SSH key by temporary runner-only ingress
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          RUNNER_IP="$(curl -fsS --max-time 20 https://api.ipify.org)"; test -n "$RUNNER_IP"
+          VNIC="$(oci compute instance list-vnics --instance-id "$INSTANCE_ID" --region "$OCI_REGION" | jq -r '.data[]|select(."is-primary"==true)|.id' | head -1)"
+          SUBNET="$(oci network vnic get --vnic-id "$VNIC" --region "$OCI_REGION" --query 'data."subnet-id"' --raw-output)"
+          SL="$(oci network subnet get --subnet-id "$SUBNET" --region "$OCI_REGION" --query 'data."security-list-ids"[0]' --raw-output)"
+          WG_ONLY='[{"source":"0.0.0.0/0","protocol":"17","isStateless":false,"udpOptions":{"destinationPortRange":{"min":51820,"max":51820}}}]'
+          TEMP="$(jq -cn --arg src "$RUNNER_IP/32" '[{source:"0.0.0.0/0",protocol:"17",isStateless:false,udpOptions:{destinationPortRange:{min:51820,max:51820}}},{source:$src,protocol:"6",isStateless:false,tcpOptions:{destinationPortRange:{min:22,max:22}}}]')"
+          cleanup_net(){ oci network security-list update --security-list-id "$SL" --ingress-security-rules "$WG_ONLY" --force >/dev/null 2>&1 || true; }
+          trap cleanup_net EXIT
+          oci network security-list update --security-list-id "$SL" --ingress-security-rules "$TEMP" --force >/dev/null
+          SSH=(-i /tmp/a1_rescue -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=8)
+          OK=0
+          for i in $(seq 1 30); do
+            if ssh "${SSH[@]}" ubuntu@"$CURRENT_PUBLIC_IP" 'echo SSH_RESCUE_OK' 2>/dev/null | grep -q SSH_RESCUE_OK; then OK=1; break; fi
+            sleep 4
+          done
+          test "$OK" = 1
+          echo 'SSH_RESCUE_OK (temporary port 22 restricted to current runner only)'
+          cleanup_net
+          trap - EXIT
+          echo "SECURITY_LIST_ID=$SL" >> "$GITHUB_ENV"
+          rm -f /tmp/console_rsa /tmp/console_rsa.pub /tmp/rescue_pub.b64 /tmp/rescue.exp /tmp/connect-console.sh
