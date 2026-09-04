@@ -1,0 +1,171 @@
+name: Oracle A1 Bootstrap Existing
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/oracle-a1-bootstrap-existing.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: oracle-a1-bootstrap-existing
+  cancel-in-progress: false
+
+jobs:
+  bootstrap:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      OCI_CONFIG: ${{ secrets.OCI_CONFIG }}
+      OCI_PRIVATE_KEY: ${{ secrets.OCI_PRIVATE_KEY }}
+      INSTANCE_NAME: troc-cloud-codex
+      PUBLIC_SUBNET_NAME: troc-codex-public-subnet
+      A1_SHAPE: VM.Standard.A1.Flex
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure OCI
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$OCI_CONFIG" && test -n "$OCI_PRIVATE_KEY"
+          python -m pip install --disable-pip-version-check --quiet oci-cli
+          mkdir -p "$HOME/.oci"
+          printf '%s\n' "$OCI_PRIVATE_KEY" > "$HOME/.oci/oci_api_key.pem"
+          chmod 600 "$HOME/.oci/oci_api_key.pem"
+          printf '%s\n' "$OCI_CONFIG" > "$HOME/.oci/config"
+          if grep -q '^key_file=' "$HOME/.oci/config"; then
+            sed -i "s#^key_file=.*#key_file=$HOME/.oci/oci_api_key.pem#" "$HOME/.oci/config"
+          else
+            echo "key_file=$HOME/.oci/oci_api_key.pem" >> "$HOME/.oci/config"
+          fi
+          chmod 600 "$HOME/.oci/config"
+          echo 'SUPPRESS_LABEL_WARNING=True' >> "$GITHUB_ENV"
+          echo 'OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING=True' >> "$GITHUB_ENV"
+          TENANCY_ID="$(awk -F= '/^tenancy=/{gsub(/[[:space:]]/,"",$2); print $2; exit}' "$HOME/.oci/config")"
+          REGION="$(awk -F= '/^region=/{gsub(/[[:space:]]/,"",$2); print $2; exit}' "$HOME/.oci/config")"
+          test -n "$TENANCY_ID"
+          [ -n "$REGION" ] || REGION='ap-singapore-2'
+          echo "OCI_TENANCY_OCID=$TENANCY_ID" >> "$GITHUB_ENV"
+          echo "OCI_REGION=$REGION" >> "$GITHUB_ENV"
+
+      - name: Validate acquired public A1
+        shell: bash
+        run: |
+          set -euo pipefail
+          INSTANCE_JSON="$(oci compute instance list --compartment-id "$OCI_TENANCY_OCID" \
+            --display-name "$INSTANCE_NAME" --all | \
+            jq -c '[.data[] | select(."lifecycle-state" != "TERMINATED")] | sort_by(."time-created") | last')"
+          test "$INSTANCE_JSON" != 'null'
+          INSTANCE_ID="$(jq -r '.id' <<<"$INSTANCE_JSON")"
+          SHAPE="$(jq -r '.shape' <<<"$INSTANCE_JSON")"
+          CPU="$(jq -r '."shape-config".ocpus' <<<"$INSTANCE_JSON")"
+          RAM="$(jq -r '."shape-config"."memory-in-gbs"' <<<"$INSTANCE_JSON")"
+          test "$SHAPE" = "$A1_SHAPE"
+          awk -v v="$CPU" 'BEGIN {exit !(v<=2)}'
+          awk -v v="$RAM" 'BEGIN {exit !(v<=12)}'
+
+          STATE=''
+          for i in $(seq 1 120); do
+            STATE="$(oci compute instance get --instance-id "$INSTANCE_ID" \
+              --query 'data."lifecycle-state"' --raw-output 2>/dev/null || true)"
+            echo "A1 state: ${STATE:-unknown}"
+            [ "$STATE" = 'RUNNING' ] && break
+            sleep 5
+          done
+          test "$STATE" = 'RUNNING'
+
+          PUBLIC_SUBNET_ID="$(oci network subnet list --compartment-id "$OCI_TENANCY_OCID" --all | \
+            jq -r --arg n "$PUBLIC_SUBNET_NAME" '.data[] | select(."display-name"==$n and ."lifecycle-state"=="AVAILABLE") | .id' | head -n1)"
+          test -n "$PUBLIC_SUBNET_ID"
+
+          VNIC_ID=''
+          for i in $(seq 1 30); do
+            VNIC_ID="$(oci compute vnic-attachment list --compartment-id "$OCI_TENANCY_OCID" \
+              --instance-id "$INSTANCE_ID" --all | jq -r '.data[0]."vnic-id" // empty' 2>/dev/null || true)"
+            [ -n "$VNIC_ID" ] && break
+            sleep 5
+          done
+          test -n "$VNIC_ID"
+          VNIC_JSON="$(oci network vnic get --vnic-id "$VNIC_ID")"
+          SUBNET_ID="$(jq -r '.data."subnet-id"' <<<"$VNIC_JSON")"
+          PUBLIC_IP="$(jq -r '.data."public-ip" // empty' <<<"$VNIC_JSON")"
+          test "$SUBNET_ID" = "$PUBLIC_SUBNET_ID"
+          test -n "$PUBLIC_IP"
+
+          echo "INSTANCE_ID=$INSTANCE_ID" >> "$GITHUB_ENV"
+          echo "OCI_PUBLIC_IP=$PUBLIC_IP" >> "$GITHUB_ENV"
+          echo "A1_CPU=$CPU" >> "$GITHUB_ENV"
+          echo "A1_RAM=$RAM" >> "$GITHUB_ENV"
+          echo "Validated public A1: $PUBLIC_IP ($CPU OCPU / $RAM GB)"
+
+      - name: Wait for Oracle Run Command plugin
+        shell: bash
+        run: |
+          set -euo pipefail
+          FOUND=''
+          for i in $(seq 1 90); do
+            PLUGINS="$(oci instance-agent plugin list --compartment-id "$OCI_TENANCY_OCID" \
+              --instanceagent-id "$INSTANCE_ID" --all 2>/dev/null || true)"
+            FOUND="$(jq -r '[.data[]? | select((.name|ascii_downcase|contains("run")) and (.name|ascii_downcase|contains("command")))][0] | [.name,.status] | @tsv' <<<"$PLUGINS" 2>/dev/null || true)"
+            echo "Run Command: ${FOUND:-waiting}"
+            STATUS="$(awk -F '\t' '{print $2}' <<<"$FOUND")"
+            [ "$STATUS" = 'RUNNING' ] && exit 0
+            sleep 10
+          done
+          echo '::error::Oracle Run Command plugin did not become RUNNING.'
+          exit 1
+
+      - name: Bootstrap Ubuntu and WireGuard
+        shell: bash
+        run: |
+          set -euo pipefail
+          SCRIPT_TEXT="$(cat scripts/oracle-a1-bootstrap.sh)"
+          CONTENT="$(jq -cn --arg text "$SCRIPT_TEXT" '{source:{sourceType:"TEXT",text:$text},output:{outputType:"TEXT"},commandString:"/bin/bash"}')"
+          TARGET="$(jq -cn --arg id "$INSTANCE_ID" '{instanceId:$id}')"
+          CMD_ID="$(oci instance-agent command create --compartment-id "$OCI_TENANCY_OCID" \
+            --content "$CONTENT" --target "$TARGET" --timeout-in-seconds 1800 \
+            --display-name 'troc-a1-bootstrap-existing' \
+            --query 'data.id' --raw-output)"
+          test -n "$CMD_ID" && test "$CMD_ID" != 'null'
+          echo "Run Command created."
+
+          FINAL=''
+          EXEC=''
+          for i in $(seq 1 180); do
+            EXEC="$(oci instance-agent command-execution get --command-id "$CMD_ID" \
+              --instance-id "$INSTANCE_ID" 2>/dev/null || true)"
+            FINAL="$(jq -r '.data."lifecycle-state" // empty' <<<"$EXEC" 2>/dev/null || true)"
+            case "$FINAL" in
+              SUCCEEDED|FAILED|TIMED_OUT|CANCELED) break ;;
+            esac
+            sleep 10
+          done
+          OUTPUT="$(jq -r '.data.content.text // .data.content.message // empty' <<<"$EXEC" 2>/dev/null || true)"
+          EXIT_CODE="$(jq -r '.data.content."exit-code" // 999' <<<"$EXEC" 2>/dev/null || echo 999)"
+          printf '%s\n' "$OUTPUT"
+          echo "Remote state=$FINAL exit=$EXIT_CODE"
+          test "$FINAL" = 'SUCCEEDED'
+          test "$EXIT_CODE" = '0'
+          WG_PUB="$(printf '%s\n' "$OUTPUT" | sed -n 's/^WG_PUBLIC_KEY=//p' | tail -n1)"
+          test -n "$WG_PUB"
+          echo "WG_SERVER_PUBLIC_KEY=$WG_PUB" >> "$GITHUB_ENV"
+
+      - name: Summary
+        shell: bash
+        run: |
+          {
+            echo '## Oracle A1 bootstrap complete'
+            echo ''
+            echo "- Region: \`$OCI_REGION\`"
+            echo "- Compute: \`$A1_CPU OCPU / $A1_RAM GB RAM / 50 GB boot\`"
+            echo "- Public IPv4: \`$OCI_PUBLIC_IP\`"
+            echo '- WireGuard: `UDP 51820`, VPN `10.77.0.0/24`, MTU `1380`'
+            echo "- WireGuard server public key: \`$WG_SERVER_PUBLIC_KEY\`"
+            echo '- Docker + Node 22 + Gemini CLI + Codex CLI + gh + Python + Java 17 installed'
+            echo '- 4 GB swap enabled'
+            echo '- OCI security list exposes only WireGuard UDP/51820 inbound; no public SSH rule.'
+          } >> "$GITHUB_STEP_SUMMARY"
