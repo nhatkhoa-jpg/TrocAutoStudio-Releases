@@ -1,0 +1,85 @@
+name: Oracle A1 Cloud-Init Recover V2
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ['work/troc-ai-mobile-v1']
+    paths:
+      - '.github/workflows/oracle-a1-cloud-init-recover-v2.yml'
+      - 'scripts/oracle-a1-cloud-init-recover.sh'
+      - 'scripts/oracle-a1-cloud-init-guest.sh'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: oracle-a1-cloud-init-recover
+  cancel-in-progress: false
+
+jobs:
+  recover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      OCI_CONFIG: ${{ secrets.OCI_CONFIG }}
+      OCI_PRIVATE_KEY: ${{ secrets.OCI_PRIVATE_KEY }}
+      OCI_SSH_PUBLIC_KEY: ${{ secrets.OCI_SSH_PUBLIC_KEY }}
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      INSTANCE_NAME: troc-cloud-codex
+      VCN_NAME: troc-codex-vcn
+      PUBLIC_SUBNET_NAME: troc-codex-public-subnet
+      SECURITY_LIST_NAME: troc-codex-public-sl
+      PHONE_WG_PUBLIC_KEY: 'nhJ3KKQ1i2SnbXVzYP6Jopt1KBaYnEk8ykV8DAMozww='
+      APP_SOURCE_REF: work/troc-ai-mobile-v1
+      TROC_AI_MODEL: gemini-3.5-flash-lite
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Preflight A1-only safety envelope
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$OCI_CONFIG"
+          test -n "$OCI_PRIVATE_KEY"
+          test -n "$OCI_SSH_PUBLIC_KEY"
+          test -n "$GEMINI_API_KEY"
+          test -n "$PHONE_WG_PUBLIC_KEY"
+          echo 'A1-only recovery: 2 OCPU / 12 GB / 50 GB, no paid fallback.'
+
+      - name: Recover, bootstrap and validate A1
+        id: recover
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x scripts/oracle-a1-cloud-init-recover.sh scripts/oracle-a1-cloud-init-guest.sh
+          scripts/oracle-a1-cloud-init-recover.sh | tee /tmp/a1-recover.log
+          INSTANCE_ID="$(sed -n 's/^RESULT_INSTANCE_ID=//p' /tmp/a1-recover.log | tail -n1)"
+          PUBLIC_IP="$(sed -n 's/^RESULT_PUBLIC_IP=//p' /tmp/a1-recover.log | tail -n1)"
+          WG_PUB="$(sed -n 's/^RESULT_WG_SERVER_PUBLIC_KEY=//p' /tmp/a1-recover.log | tail -n1)"
+          REGION="$(sed -n 's/^RESULT_REGION=//p' /tmp/a1-recover.log | tail -n1)"
+          test -n "$INSTANCE_ID" && test -n "$PUBLIC_IP" && test -n "$WG_PUB"
+          echo "instance_id=$INSTANCE_ID" >> "$GITHUB_OUTPUT"
+          echo "public_ip=$PUBLIC_IP" >> "$GITHUB_OUTPUT"
+          echo "wg_pub=$WG_PUB" >> "$GITHUB_OUTPUT"
+          echo "region=$REGION" >> "$GITHUB_OUTPUT"
+
+      - name: Summary
+        shell: bash
+        run: |
+          {
+            echo '## Oracle A1 + Trọc AI READY'
+            echo ''
+            echo "- Region: \`${{ steps.recover.outputs.region }}\`"
+            echo '- Shape: `VM.Standard.A1.Flex — 2 OCPU / 12 GB / 50 GB`'
+            echo "- Public IPv4: \`${{ steps.recover.outputs.public_ip }}\`"
+            echo '- Public ingress restored to `UDP/51820 only`'
+            echo '- WireGuard: `10.77.0.1/24`, MTU `1380`'
+            echo "- WireGuard server public key: \`${{ steps.recover.outputs.wg_pub }}\`"
+            echo '- Phone peer reserved: `10.77.0.10/32`'
+            echo '- Trọc AI: `http://10.77.0.1:8787` through WireGuard only'
+            echo '- Docker + Node 22 + Gemini CLI + Codex CLI + gh + Python + Java 17 + 4 GB swap'
+            echo '- `troc-ai.service`: restart-always, 24/7'
+            echo '- `troc-ai-update.timer`: updates app from `main` about every 5 minutes'
+            echo '- Real health and Gemini chat smoke validated through an ephemeral WireGuard peer'
+          } >> "$GITHUB_STEP_SUMMARY"
