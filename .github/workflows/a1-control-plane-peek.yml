@@ -1,0 +1,32 @@
+name: A1 Control Plane Peek
+on:
+  push:
+    branches: ['work/troc-ai-mobile-v1']
+    paths: ['.github/workflows/a1-control-plane-peek.yml']
+permissions:
+  contents: read
+jobs:
+  peek:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      OCI_CONFIG: ${{ secrets.OCI_CONFIG }}
+      OCI_PRIVATE_KEY: ${{ secrets.OCI_PRIVATE_KEY }}
+    steps:
+      - name: Inspect
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check --quiet oci-cli
+          mkdir -p "$HOME/.oci"
+          printf '%s\n' "$OCI_PRIVATE_KEY" > "$HOME/.oci/key.pem"; chmod 600 "$HOME/.oci/key.pem"
+          printf '%s\n' "$OCI_CONFIG" > "$HOME/.oci/config"; chmod 600 "$HOME/.oci/config"
+          if grep -q '^key_file=' "$HOME/.oci/config"; then sed -i "s#^key_file=.*#key_file=$HOME/.oci/key.pem#" "$HOME/.oci/config"; else echo "key_file=$HOME/.oci/key.pem" >> "$HOME/.oci/config"; fi
+          export SUPPRESS_LABEL_WARNING=True OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING=True
+          T="$(awk -F= '/^tenancy=/{gsub(/[[:space:]]/,"",$2);print $2;exit}' "$HOME/.oci/config")"
+          oci compute instance list --compartment-id "$T" --display-name troc-cloud-codex --all | jq -r '.data[] | [.id,."lifecycle-state",.shape,."shape-config".ocpus,."shape-config"."memory-in-gbs",."time-created"] | @tsv'
+          ID="$(oci compute instance list --compartment-id "$T" --display-name troc-cloud-codex --all | jq -r '[.data[]|select(."lifecycle-state"!="TERMINATED")]|sort_by(."time-created")|last|.id//empty')"
+          if [ -n "$ID" ]; then
+            V="$(oci compute vnic-attachment list --compartment-id "$T" --instance-id "$ID" --all | jq -r '.data[0]."vnic-id"//empty')"
+            [ -z "$V" ] || oci network vnic get --vnic-id "$V" --query 'data.{publicIp:"public-ip",privateIp:"private-ip",subnet:"subnet-id"}'
+          fi
