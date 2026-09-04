@@ -1,0 +1,38 @@
+name: Oracle A1 Serial SSH Rescue V6
+
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/oracle-a1-serial-ssh-rescue-v6.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  rescue:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      OCI_CONFIG: ${{ secrets.OCI_CONFIG }}
+      OCI_PRIVATE_KEY: ${{ secrets.OCI_PRIVATE_KEY }}
+      EXPECTED_REGION: ap-singapore-2
+      INSTANCE_NAME: troc-cloud-codex
+    steps:
+      - name: Execute corrected V5 rescue
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python -m pip install --disable-pip-version-check --quiet pyyaml
+          curl -fsSL "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${GITHUB_SHA%????????????????????????????????????????}/.github/workflows/oracle-a1-serial-ssh-rescue-v5.yml" -o /tmp/v5.yml 2>/dev/null || \
+            curl -fsSL "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/.github/workflows/oracle-a1-serial-ssh-rescue-v5.yml" -o /tmp/v5.yml
+          python - <<'PY'
+          import yaml
+          p='/tmp/v5.yml'
+          d=yaml.safe_load(open(p, encoding='utf-8'))
+          script=d['jobs']['rescue']['steps'][0]['run']
+          script=script.replace('."tcp-options".destination."port-range".min', '(."tcp-options"."destination-port-range".min // ."tcp-options".destination."port-range".min)')
+          script=script.replace('."udp-options".destination."port-range".min', '(."udp-options"."destination-port-range".min // ."udp-options".destination."port-range".min)')
+          open('/tmp/rescue.sh','w',encoding='utf-8').write(script)
+          PY
+          bash /tmp/rescue.sh
