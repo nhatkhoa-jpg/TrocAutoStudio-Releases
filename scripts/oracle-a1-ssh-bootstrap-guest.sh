@@ -10,8 +10,30 @@ source /tmp/troc-bootstrap.env
 : "${TROC_AI_MODEL:?}"
 test -s /tmp/gemini.env
 
-apt-get update -y
-apt-get install -y --no-install-recommends \
+apt_retry() {
+  local attempt=1
+  local max_attempts=60
+  local rc=0
+  while true; do
+    set +e
+    "$@"
+    rc=$?
+    set -e
+    [ "$rc" -eq 0 ] && return 0
+    if [ "$attempt" -ge "$max_attempts" ]; then
+      echo "APT command still failing after ${attempt} attempts: $*" >&2
+      return "$rc"
+    fi
+    echo "APT busy/transient failure (rc=$rc); retry ${attempt}/${max_attempts} in 5s..."
+    attempt=$((attempt + 1))
+    sleep 5
+  done
+}
+
+# Fresh Ubuntu images commonly run apt/cloud-init for a short time after SSH becomes available.
+# Retry instead of failing the whole A1 bootstrap on a transient dpkg/apt lock.
+apt_retry apt-get update -y
+apt_retry apt-get install -y --no-install-recommends \
   ca-certificates curl git jq unzip zip rsync tmux htop ripgrep \
   build-essential python3 python3-pip python3-venv openjdk-17-jdk-headless \
   docker.io gh wireguard-tools iptables iproute2
@@ -50,7 +72,7 @@ systemctl enable --now docker
 usermod -aG docker ubuntu || true
 if ! command -v node >/dev/null 2>&1 || [ "$(node -p 'Number(process.versions.node.split(".")[0])' 2>/dev/null || echo 0)" -lt 22 ]; then
   curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
-  apt-get install -y nodejs
+  apt_retry apt-get install -y nodejs
 fi
 npm install -g npm@latest @google/gemini-cli @openai/codex
 
