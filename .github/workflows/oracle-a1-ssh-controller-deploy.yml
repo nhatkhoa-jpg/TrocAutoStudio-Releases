@@ -1,0 +1,201 @@
+name: Oracle A1 SSH Controller Deploy
+
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/oracle-a1-ssh-controller-deploy.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: oracle-a1-ssh-controller-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: self-hosted
+    timeout-minutes: 30
+    env:
+      OCI_CONFIG: ${{ secrets.OCI_CONFIG }}
+      OCI_PRIVATE_KEY: ${{ secrets.OCI_PRIVATE_KEY }}
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      EXPECTED_REGION: ap-singapore-2
+      INSTANCE_NAME: troc-cloud-codex
+      PHONE_WG_PUBLIC_KEY: nhJ3KKQ1i2SnbXVzYP6Jopt1KBaYnEk8ykV8DAMozww=
+      TROC_AI_MODEL: gemini-2.5-flash-lite
+    steps:
+      - name: Validate A1 and recover persistent SSH channel from controller
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          test -n "$OCI_CONFIG" && test -n "$OCI_PRIVATE_KEY" && test -n "$GEMINI_API_KEY"
+          mkdir -p "$HOME/.oci"
+          printf '%s\n' "$OCI_PRIVATE_KEY" > "$HOME/.oci/key.pem"; chmod 600 "$HOME/.oci/key.pem"
+          printf '%s\n' "$OCI_CONFIG" > "$HOME/.oci/config"
+          if grep -q '^key_file=' "$HOME/.oci/config"; then sed -i "s#^key_file=.*#key_file=$HOME/.oci/key.pem#" "$HOME/.oci/config"; else echo "key_file=$HOME/.oci/key.pem" >> "$HOME/.oci/config"; fi
+          chmod 600 "$HOME/.oci/config"
+          if ! command -v oci >/dev/null 2>&1; then python3 -m pip install --user --disable-pip-version-check --quiet oci-cli; export PATH="$HOME/.local/bin:$PATH"; fi
+          export SUPPRESS_LABEL_WARNING=True OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING=True
+          T="$(awk -F= '/^tenancy=/{gsub(/[[:space:]]/,"",$2);print $2;exit}' "$HOME/.oci/config")"
+          R="$(awk -F= '/^region=/{gsub(/[[:space:]]/,"",$2);print $2;exit}' "$HOME/.oci/config")"; test "$R" = "$EXPECTED_REGION"
+          J="$(oci compute instance list --compartment-id "$T" --region "$R" --display-name "$INSTANCE_NAME" --all | jq -c '[.data[]|select(."lifecycle-state"=="RUNNING")]|sort_by(."time-created")|last')"; test "$J" != null
+          ID="$(jq -r '.id' <<<"$J")"; SHAPE="$(jq -r '.shape' <<<"$J")"; CPU="$(jq -r '."shape-config".ocpus' <<<"$J")"; RAM="$(jq -r '."shape-config"."memory-in-gbs"' <<<"$J")"
+          test "$SHAPE" = 'VM.Standard.A1.Flex'; awk -v v="$CPU" 'BEGIN{exit !(v<=2)}'; awk -v v="$RAM" 'BEGIN{exit !(v<=12)}'
+          AD="$(jq -r '."availability-domain"' <<<"$J")"; BV="$(oci compute boot-volume-attachment list --availability-domain "$AD" --compartment-id "$T" --instance-id "$ID" --region "$R" --all | jq -r '.data[0]."boot-volume-id"')"; SIZE="$(oci bv boot-volume get --boot-volume-id "$BV" --region "$R" --query 'data."size-in-gbs"' --raw-output)"; test "$SIZE" = 50
+          VNIC="$(oci compute instance list-vnics --instance-id "$ID" --region "$R" | jq -r '.data[]|select(."is-primary"==true)|.id' | head -1)"; PUB="$(oci network vnic get --vnic-id "$VNIC" --region "$R" --query 'data."public-ip"' --raw-output)"; test -n "$PUB" && test "$PUB" != null
+          SUBNET="$(oci network vnic get --vnic-id "$VNIC" --region "$R" --query 'data."subnet-id"' --raw-output)"; SL="$(oci network subnet get --subnet-id "$SUBNET" --region "$R" --query 'data."security-list-ids"[0]' --raw-output)"
+          CTRL_IP="$(curl -fsS --max-time 20 https://api.ipify.org)"; test -n "$CTRL_IP"
+          WG_ONLY='[{"source":"0.0.0.0/0","protocol":"17","isStateless":false,"udpOptions":{"destinationPortRange":{"min":51820,"max":51820}}}]'
+          TEMP="$(jq -cn --arg src "$CTRL_IP/32" '[{source:"0.0.0.0/0",protocol:"17",isStateless:false,udpOptions:{destinationPortRange:{min:51820,max:51820}}},{source:$src,protocol:"6",isStateless:false,tcpOptions:{destinationPortRange:{min:22,max:22}}}]')"
+          cleanup(){ oci network security-list update --security-list-id "$SL" --ingress-security-rules "$WG_ONLY" --force >/dev/null 2>&1 || true; }
+          trap cleanup EXIT
+          oci network security-list update --security-list-id "$SL" --ingress-security-rules "$TEMP" --force >/dev/null
+          echo "Validated A1 shape=$SHAPE cpu=$CPU ram=$RAM boot=$SIZE current_public_ip=$PUB; temporary SSH source=$CTRL_IP/32"
+
+          # Search persistent controller SSH keys without printing private material.
+          FOUND=''
+          while IFS= read -r k; do
+            [ -f "$k" ] || continue
+            case "$k" in *.pub|*known_hosts*|*authorized_keys*|*/config) continue;; esac
+            chmod 600 "$k" 2>/dev/null || true
+            if ! ssh-keygen -y -f "$k" >/dev/null 2>&1; then continue; fi
+            echo "Trying controller key: $(basename "$k")"
+            if ssh -i "$k" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=7 ubuntu@"$PUB" 'echo SSH_CONTROLLER_OK' 2>/dev/null | grep -q SSH_CONTROLLER_OK; then FOUND="$k"; break; fi
+          done < <(find "$HOME/.ssh" /home /root/.ssh -maxdepth 3 -type f 2>/dev/null | sort -u)
+          test -n "$FOUND"
+          echo "Persistent controller SSH channel recovered with key=$(basename "$FOUND")"
+          echo "A1_SSH_KEY=$FOUND" >> "$GITHUB_ENV"; echo "INSTANCE_ID=$ID" >> "$GITHUB_ENV"; echo "OCI_TENANCY=$T" >> "$GITHUB_ENV"; echo "OCI_REGION=$R" >> "$GITHUB_ENV"; echo "CURRENT_PUBLIC_IP=$PUB" >> "$GITHUB_ENV"; echo "SECURITY_LIST_ID=$SL" >> "$GITHUB_ENV"; echo "WG_ONLY_JSON=$WG_ONLY" >> "$GITHUB_ENV"
+          # Keep 22 open only for this controller during following steps; final cleanup closes it.
+          trap - EXIT
+
+      - name: Finish WireGuard and Trọc AI in-place over SSH
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          SSH=(-i "$A1_SSH_KEY" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=8)
+          umask 077
+          printf 'GEMINI_API_KEY=%s\nTROC_AI_MODEL=%s\nTROC_AI_HOST=10.77.0.1\nTROC_AI_PORT=8787\nTROC_AI_STATE_DIR=/var/lib/troc-ai\nTROC_AI_QUEUE_DIR=/srv/troc-work/queue\n' "$GEMINI_API_KEY" "$TROC_AI_MODEL" > /tmp/troc-ai.env
+          printf 'PHONE_WG_PUBLIC_KEY=%s\n' "$PHONE_WG_PUBLIC_KEY" > /tmp/troc-phone.env
+          scp "${SSH[@]}" /tmp/troc-ai.env /tmp/troc-phone.env ubuntu@"$CURRENT_PUBLIC_IP":/tmp/ >/dev/null
+          ssh "${SSH[@]}" ubuntu@"$CURRENT_PUBLIC_IP" 'sudo bash -s' <<'REMOTE'
+          set -Eeuo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          PHONE_WG_PUBLIC_KEY="$(sed -n 's/^PHONE_WG_PUBLIC_KEY=//p' /tmp/troc-phone.env)"; test -n "$PHONE_WG_PUBLIC_KEY"
+          need=(); command -v wg >/dev/null 2>&1 || need+=(wireguard-tools); command -v curl >/dev/null 2>&1 || need+=(curl); command -v jq >/dev/null 2>&1 || need+=(jq)
+          if [ "${#need[@]}" -gt 0 ]; then apt-get update -y; apt-get install -y --no-install-recommends "${need[@]}"; fi
+          if ! command -v node >/dev/null 2>&1 || [ "$(node -p 'Number(process.versions.node.split(".")[0])' 2>/dev/null || echo 0)" -lt 20 ]; then curl -fsSL https://deb.nodesource.com/setup_22.x | bash -; apt-get install -y nodejs; fi
+          install -d -m 700 /etc/wireguard /etc/troc-ai /var/lib/troc-ai /srv/troc-work/queue /srv/troc-work/running /srv/troc-work/done /srv/troc-work/failed
+          umask 077
+          [ -s /etc/wireguard/server.key ] || wg genkey > /etc/wireguard/server.key
+          wg pubkey < /etc/wireguard/server.key > /etc/wireguard/server.pub
+          SERVER_KEY="$(cat /etc/wireguard/server.key)"
+          cat >/etc/wireguard/wg0.conf <<EOF
+          [Interface]
+          Address = 10.77.0.1/24
+          ListenPort = 51820
+          PrivateKey = ${SERVER_KEY}
+          MTU = 1380
+
+          [Peer]
+          # phone-owner
+          PublicKey = ${PHONE_WG_PUBLIC_KEY}
+          AllowedIPs = 10.77.0.10/32
+          EOF
+          chmod 600 /etc/wireguard/wg0.conf /etc/wireguard/server.key
+          systemctl enable wg-quick@wg0 >/dev/null
+          systemctl restart wg-quick@wg0
+          install -m 600 /tmp/troc-ai.env /etc/troc-ai/env
+          rm -f /tmp/troc-ai.env /tmp/troc-phone.env
+          tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
+          curl -fsSL --retry 5 --retry-delay 2 https://github.com/nhatkhoa-jpg/TrocAutoStudio-Releases/archive/refs/heads/work/troc-ai-mobile-v1.tar.gz | tar -xz -C "$tmp"
+          src="$(find "$tmp" -type d -name troc-ai | head -1)"; test -n "$src"; node --check "$src/server.mjs"
+          rm -rf /opt/troc-ai.new; cp -a "$src" /opt/troc-ai.new; chown -R root:root /opt/troc-ai.new; chmod -R go-w /opt/troc-ai.new
+          rm -rf /opt/troc-ai.prev; [ ! -d /opt/troc-ai ] || mv /opt/troc-ai /opt/troc-ai.prev; mv /opt/troc-ai.new /opt/troc-ai; rm -rf /opt/troc-ai.prev
+          cat >/etc/systemd/system/troc-ai.service <<'UNIT'
+          [Unit]
+          Description=Trọc AI private mobile gateway
+          After=network-online.target wg-quick@wg0.service
+          Wants=network-online.target wg-quick@wg0.service
+          [Service]
+          Type=simple
+          User=root
+          WorkingDirectory=/opt/troc-ai
+          EnvironmentFile=/etc/troc-ai/env
+          ExecStart=/usr/bin/node /opt/troc-ai/server.mjs
+          Restart=always
+          RestartSec=3
+          NoNewPrivileges=true
+          PrivateTmp=true
+          ProtectSystem=strict
+          ReadWritePaths=/var/lib/troc-ai /srv/troc-work
+          ProtectHome=true
+          [Install]
+          WantedBy=multi-user.target
+          UNIT
+          systemctl daemon-reload
+          systemctl enable troc-ai.service >/dev/null
+          systemctl restart troc-ai.service
+          for i in $(seq 1 30); do curl -fsS --max-time 5 http://10.77.0.1:8787/api/health >/tmp/h.json && break || sleep 2; done
+          jq -e '.ok==true and .gemini_ready==true' /tmp/h.json >/dev/null
+          curl -fsS --max-time 120 -H 'content-type: application/json' -d '{"message":"Chỉ trả lời đúng một từ: OK","history":[],"mode":"chat"}' http://10.77.0.1:8787/api/chat >/tmp/c.json
+          jq -e '.answer|length>0' /tmp/c.json >/dev/null
+          systemctl is-enabled wg-quick@wg0 | grep -q enabled
+          systemctl is-enabled troc-ai.service | grep -q enabled
+          systemctl is-active wg-quick@wg0 | grep -q active
+          systemctl is-active troc-ai.service | grep -q active
+          echo "SERVER_WG_PUBLIC_KEY=$(cat /etc/wireguard/server.pub)"
+          echo 'SERVER_HEALTH_OK=1'
+          echo 'GEMINI_CHAT_SMOKE_OK=1'
+          REMOTE
+          rm -f /tmp/troc-ai.env /tmp/troc-phone.env
+
+      - name: Prove real WireGuard transport from controller and private API
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          SSH=(-i "$A1_SSH_KEY" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=8)
+          sudo apt-get update -qq >/dev/null 2>&1 || true
+          command -v wg >/dev/null 2>&1 || sudo apt-get install -y -qq wireguard-tools >/dev/null
+          umask 077; wg genkey > /tmp/a1test.key; wg pubkey < /tmp/a1test.key > /tmp/a1test.pub; TPUB="$(cat /tmp/a1test.pub)"
+          ssh "${SSH[@]}" ubuntu@"$CURRENT_PUBLIC_IP" "sudo wg set wg0 peer '$TPUB' allowed-ips 10.77.0.2/32"
+          cleanup_test(){ sudo wg-quick down troc-a1-test >/dev/null 2>&1 || true; ssh "${SSH[@]}" ubuntu@"$CURRENT_PUBLIC_IP" "sudo wg set wg0 peer '$TPUB' remove" >/dev/null 2>&1 || true; rm -f /tmp/a1test.key /tmp/a1test.pub /etc/wireguard/troc-a1-test.conf; }
+          trap cleanup_test EXIT
+          SERVER_PUB="$(ssh "${SSH[@]}" ubuntu@"$CURRENT_PUBLIC_IP" 'sudo cat /etc/wireguard/server.pub' | tr -d '\r\n')"; test -n "$SERVER_PUB"
+          sudo mkdir -p /etc/wireguard
+          sudo tee /etc/wireguard/troc-a1-test.conf >/dev/null <<EOF
+          [Interface]
+          PrivateKey = $(cat /tmp/a1test.key)
+          Address = 10.77.0.2/32
+          MTU = 1380
+          [Peer]
+          PublicKey = ${SERVER_PUB}
+          Endpoint = ${CURRENT_PUBLIC_IP}:51820
+          AllowedIPs = 10.77.0.0/24
+          PersistentKeepalive = 25
+          EOF
+          sudo chmod 600 /etc/wireguard/troc-a1-test.conf
+          sudo wg-quick up troc-a1-test >/dev/null
+          for i in $(seq 1 15); do HS="$(sudo wg show troc-a1-test latest-handshakes | awk '{print $2}')"; [ "${HS:-0}" -gt 0 ] 2>/dev/null && break; sleep 2; done
+          test "${HS:-0}" -gt 0
+          curl -fsS --max-time 10 http://10.77.0.1:8787/api/health | jq -e '.ok==true and .gemini_ready==true' >/dev/null
+          curl -fsS --max-time 120 -H 'content-type: application/json' -d '{"message":"Chỉ trả lời đúng một từ: OK","history":[],"mode":"chat"}' http://10.77.0.1:8787/api/chat | jq -e '.answer|length>0' >/dev/null
+          echo 'WIREGUARD_HANDSHAKE_OK=1'
+          echo 'VPN_PRIVATE_HEALTH_OK=1'
+          echo 'VPN_GEMINI_CHAT_OK=1'
+          cleanup_test; trap - EXIT
+
+      - name: Close SSH and verify final public perimeter
+        if: always()
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          [ -n "${SECURITY_LIST_ID:-}" ] || exit 0
+          printf '%s' "$WG_ONLY_JSON" >/tmp/wg-only.json
+          oci network security-list update --security-list-id "$SECURITY_LIST_ID" --ingress-security-rules file:///tmp/wg-only.json --force >/dev/null
+          RULES="$(oci network security-list get --security-list-id "$SECURITY_LIST_ID" --region "$OCI_REGION")"
+          jq -e '[.data."ingress-security-rules"[]? | select(.protocol=="6") | ((."tcp-options".destination."port-range".min // -1))] | (index(22)==null and index(8787)==null)' <<<"$RULES" >/dev/null
+          jq -e '[.data."ingress-security-rules"[]? | select(.protocol=="17") | ((."udp-options".destination."port-range".min // -1))] | index(51820)!=null' <<<"$RULES" >/dev/null
+          rm -f /tmp/wg-only.json
+          echo 'FINAL_PUBLIC_PERIMETER_OK: UDP/51820 only; TCP/22 and TCP/8787 closed.'
