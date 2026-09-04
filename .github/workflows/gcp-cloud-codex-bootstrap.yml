@@ -1,0 +1,166 @@
+name: GCP Cloud Codex Bootstrap
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '*/5 * * * *'
+
+permissions:
+  contents: read
+  id-token: write
+  actions: write
+
+concurrency:
+  group: gcp-cloud-codex-bootstrap
+  cancel-in-progress: false
+
+jobs:
+  bootstrap:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      PROJECT_ID: troc-cloud-codex
+      PROJECT_NUMBER: '132152471096'
+      ZONE: us-west1-b
+      VM: troc-cloud-codex-vm
+      WIF_PROVIDER: projects/132152471096/locations/global/workloadIdentityPools/github-pool/providers/github
+      DEPLOYER_SA: github-cloud-codex@troc-cloud-codex.iam.gserviceaccount.com
+
+    steps:
+      - name: Preflight Gemini secret
+        id: preflight
+        shell: bash
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GEMINI_API_KEY:-}" ]; then
+            echo "::error::GEMINI_API_KEY is missing"
+            exit 1
+          fi
+          echo "Gemini secret present."
+
+      - name: Authenticate to Google Cloud
+        id: auth
+        uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: ${{ env.WIF_PROVIDER }}
+          service_account: ${{ env.DEPLOYER_SA }}
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v3
+        with:
+          project_id: ${{ env.PROJECT_ID }}
+
+      - name: Verify VM
+        shell: bash
+        run: |
+          set -euo pipefail
+          gcloud compute instances describe "$VM" --zone="$ZONE" --project="$PROJECT_ID" --format='table(name,status,machineType.basename(),disks[0].diskSizeGb)'
+
+      - name: Prepare Gemini env securely
+        shell: bash
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          set -euo pipefail
+          umask 077
+          printf 'GEMINI_API_KEY=%s\n' "$GEMINI_API_KEY" > /tmp/gemini.env
+
+      - name: Copy Gemini key to VM
+        shell: bash
+        run: |
+          set -euo pipefail
+          gcloud compute scp --quiet /tmp/gemini.env "$VM:/tmp/gemini.env" --zone="$ZONE" --project="$PROJECT_ID"
+
+      - name: Bootstrap VM
+        shell: bash
+        run: |
+          set -euo pipefail
+          gcloud compute ssh "$VM" --quiet --zone="$ZONE" --project="$PROJECT_ID" --command='bash -s' <<'REMOTE'
+          set -Eeuo pipefail
+
+          sudo mkdir -p /etc/troc-codex /opt/troc-codex/workspaces
+          sudo install -m 600 /tmp/gemini.env /etc/troc-codex/gemini.env
+          rm -f /tmp/gemini.env
+
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            git curl jq unzip python3 python3-pip python3-venv \
+            build-essential ca-certificates gnupg docker.io
+
+          if ! command -v node >/dev/null 2>&1 || [ "$(node -p 'parseInt(process.versions.node)' 2>/dev/null || echo 0)" -lt 20 ]; then
+            curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
+            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y nodejs
+          fi
+
+          sudo npm install -g @google/gemini-cli@latest
+          sudo systemctl enable --now docker
+          sudo usermod -aG docker "${USER}" || true
+
+          sudo tee /usr/local/bin/troc-gemini >/dev/null <<'SH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          set -a
+          source /etc/troc-codex/gemini.env
+          set +a
+          exec gemini "$@"
+          SH
+          sudo chmod 755 /usr/local/bin/troc-gemini
+
+          sudo tee /etc/systemd/system/troc-cloud-codex.service >/dev/null <<'UNIT'
+          [Unit]
+          Description=Troc Cloud Codex controller placeholder
+          After=network-online.target docker.service
+          Wants=network-online.target
+
+          [Service]
+          Type=simple
+          User=root
+          EnvironmentFile=/etc/troc-codex/gemini.env
+          ExecStart=/bin/bash -lc 'while true; do sleep 3600; done'
+          Restart=always
+          RestartSec=5
+
+          [Install]
+          WantedBy=multi-user.target
+          UNIT
+
+          sudo systemctl daemon-reload
+          sudo systemctl enable --now troc-cloud-codex.service
+
+          echo '=== TRỌC CLOUD CODEX VM READY ==='
+          uname -a
+          node --version
+          npm --version
+          python3 --version
+          git --version
+          docker --version
+          gemini --version
+          systemctl is-active troc-cloud-codex.service
+          df -h /
+          free -h
+          REMOTE
+
+      - name: Summary
+        shell: bash
+        run: |
+          {
+            echo '## GCP Cloud Codex bootstrap complete'
+            echo ''
+            echo '- VM: `troc-cloud-codex-vm`'
+            echo '- Zone: `us-west1-b`'
+            echo '- Machine: `e2-micro`'
+            echo '- Gemini CLI: installed'
+            echo '- Gemini key: injected from existing GitHub secret'
+            echo '- Docker/Node/Python/Git: installed'
+            echo '- Controller service: active'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Disable bootstrap workflow after success
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          gh workflow disable gcp-cloud-codex-bootstrap.yml --repo "$GITHUB_REPOSITORY" || true
+          echo 'Bootstrap workflow disabled after successful setup.'
