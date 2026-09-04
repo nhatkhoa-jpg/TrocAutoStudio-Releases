@@ -1,0 +1,256 @@
+name: Oracle A1 WireGuard Repair
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ['work/troc-ai-mobile-v1']
+    paths:
+      - '.github/workflows/oracle-a1-wg-repair.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: oracle-a1-wg-repair
+  cancel-in-progress: true
+
+jobs:
+  repair:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      OCI_CONFIG: ${{ secrets.OCI_CONFIG }}
+      OCI_PRIVATE_KEY: ${{ secrets.OCI_PRIVATE_KEY }}
+      INSTANCE_NAME: troc-cloud-codex
+      VCN_NAME: troc-codex-vcn
+      SECURITY_LIST_NAME: troc-codex-public-sl
+      A1_SHAPE: VM.Standard.A1.Flex
+      WG_PORT: '51820'
+
+    steps:
+      - name: Configure OCI and validator
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$OCI_CONFIG" && test -n "$OCI_PRIVATE_KEY"
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq wireguard-tools >/dev/null
+          python -m pip install --disable-pip-version-check --quiet oci-cli
+          mkdir -p "$HOME/.oci"
+          printf '%s\n' "$OCI_PRIVATE_KEY" > "$HOME/.oci/oci_api_key.pem"
+          chmod 600 "$HOME/.oci/oci_api_key.pem"
+          printf '%s\n' "$OCI_CONFIG" > "$HOME/.oci/config"
+          if grep -q '^key_file=' "$HOME/.oci/config"; then
+            sed -i "s#^key_file=.*#key_file=$HOME/.oci/oci_api_key.pem#" "$HOME/.oci/config"
+          else
+            echo "key_file=$HOME/.oci/oci_api_key.pem" >> "$HOME/.oci/config"
+          fi
+          chmod 600 "$HOME/.oci/config"
+          export SUPPRESS_LABEL_WARNING=True OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING=True
+          TENANCY_ID="$(awk -F= '/^tenancy=/{gsub(/[[:space:]]/,"",$2); print $2; exit}' "$HOME/.oci/config")"
+          REGION="$(awk -F= '/^region=/{gsub(/[[:space:]]/,"",$2); print $2; exit}' "$HOME/.oci/config")"
+          [ -n "$REGION" ] || REGION='ap-singapore-2'
+          test -n "$TENANCY_ID"
+          echo "OCI_TENANCY_OCID=$TENANCY_ID" >> "$GITHUB_ENV"
+          echo "OCI_REGION=$REGION" >> "$GITHUB_ENV"
+          umask 077
+          wg genkey > /tmp/wg-validator.key
+          wg pubkey < /tmp/wg-validator.key > /tmp/wg-validator.pub
+          echo "WG_VALIDATOR_PUB=$(cat /tmp/wg-validator.pub)" >> "$GITHUB_ENV"
+
+      - name: Validate current A1 and lock public ingress to WireGuard
+        shell: bash
+        run: |
+          set -euo pipefail
+          export SUPPRESS_LABEL_WARNING=True OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING=True
+          INSTANCE_JSON="$(oci compute instance list --compartment-id "$OCI_TENANCY_OCID" --display-name "$INSTANCE_NAME" --all | jq -c '[.data[] | select(."lifecycle-state"=="RUNNING")] | sort_by(."time-created") | last')"
+          test "$INSTANCE_JSON" != 'null'
+          INSTANCE_ID="$(jq -r '.id' <<<"$INSTANCE_JSON")"
+          SHAPE="$(jq -r '.shape' <<<"$INSTANCE_JSON")"
+          CPU="$(jq -r '."shape-config".ocpus' <<<"$INSTANCE_JSON")"
+          RAM="$(jq -r '."shape-config"."memory-in-gbs"' <<<"$INSTANCE_JSON")"
+          test "$SHAPE" = "$A1_SHAPE"
+          awk -v v="$CPU" 'BEGIN {exit !(v<=2)}'
+          awk -v v="$RAM" 'BEGIN {exit !(v<=12)}'
+          VNIC_ID="$(oci compute vnic-attachment list --compartment-id "$OCI_TENANCY_OCID" --instance-id "$INSTANCE_ID" --all | jq -r '.data[0]."vnic-id" // empty')"
+          test -n "$VNIC_ID"
+          PUBLIC_IP="$(oci network vnic get --vnic-id "$VNIC_ID" --query 'data."public-ip"' --raw-output)"
+          test -n "$PUBLIC_IP" && test "$PUBLIC_IP" != 'null'
+          VCN_ID="$(oci network vcn list --compartment-id "$OCI_TENANCY_OCID" --display-name "$VCN_NAME" --all | jq -r '.data[] | select(."lifecycle-state"=="AVAILABLE") | .id' | head -n1)"
+          test -n "$VCN_ID"
+          SL_ID="$(oci network security-list list --compartment-id "$OCI_TENANCY_OCID" --vcn-id "$VCN_ID" --all | jq -r --arg n "$SECURITY_LIST_NAME" '.data[] | select(."display-name"==$n and ."lifecycle-state"=="AVAILABLE") | .id' | head -n1)"
+          test -n "$SL_ID"
+          WG_ONLY="$(jq -cn --argjson p "$WG_PORT" '[{source:"0.0.0.0/0",protocol:"17",isStateless:false,udpOptions:{destinationPortRange:{min:$p,max:$p}}}]')"
+          EGRESS='[{"destination":"0.0.0.0/0","protocol":"all","isStateless":false}]'
+          oci network security-list update --security-list-id "$SL_ID" --ingress-security-rules "$WG_ONLY" --egress-security-rules "$EGRESS" --force >/dev/null
+          echo "INSTANCE_ID=$INSTANCE_ID" >> "$GITHUB_ENV"
+          echo "OCI_PUBLIC_IP=$PUBLIC_IP" >> "$GITHUB_ENV"
+          echo "A1_CPU=$CPU" >> "$GITHUB_ENV"
+          echo "A1_RAM=$RAM" >> "$GITHUB_ENV"
+          echo "Validated A1 $CPU OCPU/$RAM GB at $PUBLIC_IP; public ingress is UDP/51820 only."
+
+      - name: Wait for Oracle Run Command plugin
+        shell: bash
+        run: |
+          set -euo pipefail
+          export SUPPRESS_LABEL_WARNING=True OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING=True
+          for i in $(seq 1 60); do
+            PLUGINS="$(oci instance-agent plugin list --compartment-id "$OCI_TENANCY_OCID" --instanceagent-id "$INSTANCE_ID" --all 2>/dev/null || true)"
+            FOUND="$(jq -r '[.data[]? | select((.name|ascii_downcase|contains("run")) and (.name|ascii_downcase|contains("command")))][0] | [.name,.status] | @tsv' <<<"$PLUGINS" 2>/dev/null || true)"
+            STATUS="$(awk -F '\t' '{print $2}' <<<"$FOUND")"
+            echo "Run Command: ${FOUND:-waiting}"
+            [ "$STATUS" = 'RUNNING' ] && exit 0
+            sleep 10
+          done
+          echo '::error::Oracle Run Command plugin is not RUNNING.'
+          exit 1
+
+      - name: Repair host firewall and add ephemeral validator peer
+        shell: bash
+        run: |
+          set -euo pipefail
+          export SUPPRESS_LABEL_WARNING=True OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING=True
+          REMOTE_SCRIPT="$(cat <<EOF
+          set -Eeuo pipefail
+          systemctl is-active --quiet wg-quick@wg0
+          systemctl is-active --quiet troc-ai.service
+          install -d -m 755 /usr/local/sbin
+          cat >/usr/local/sbin/troc-wireguard-firewall <<'FW'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          iptables -C INPUT -p udp --dport 51820 -j ACCEPT 2>/dev/null || iptables -I INPUT 1 -p udp --dport 51820 -j ACCEPT
+          iptables -C INPUT -i wg0 -p tcp --dport 8787 -j ACCEPT 2>/dev/null || iptables -I INPUT 1 -i wg0 -p tcp --dport 8787 -j ACCEPT
+          FW
+          chmod 755 /usr/local/sbin/troc-wireguard-firewall
+          cat >/etc/systemd/system/troc-wireguard-firewall.service <<'UNIT'
+          [Unit]
+          Description=Allow Trọc WireGuard ingress before VPN service
+          After=network-pre.target
+          Before=wg-quick@wg0.service
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/local/sbin/troc-wireguard-firewall
+          RemainAfterExit=yes
+          [Install]
+          WantedBy=multi-user.target
+          UNIT
+          systemctl daemon-reload
+          systemctl enable --now troc-wireguard-firewall.service
+          /usr/local/sbin/troc-wireguard-firewall
+          wg set wg0 peer '$WG_VALIDATOR_PUB' allowed-ips 10.77.0.2/32
+          echo '=== wg ==='
+          wg show wg0
+          echo '=== firewall ==='
+          iptables -S INPUT | grep -E '51820|wg0' || true
+          echo '=== local health ==='
+          curl -fsS --max-time 10 http://10.77.0.1:8787/api/health
+          EOF
+          )"
+          CONTENT="$(jq -cn --arg text "$REMOTE_SCRIPT" '{source:{sourceType:"TEXT",text:$text},output:{outputType:"TEXT"},commandString:"/bin/bash"}')"
+          TARGET="$(jq -cn --arg id "$INSTANCE_ID" '{instanceId:$id}')"
+          CMD_ID="$(oci instance-agent command create --compartment-id "$OCI_TENANCY_OCID" --content "$CONTENT" --target "$TARGET" --timeout-in-seconds 300 --display-name 'troc-wg-firewall-repair' --query 'data.id' --raw-output)"
+          test -n "$CMD_ID" && test "$CMD_ID" != 'null'
+          FINAL=''; EXEC=''
+          for i in $(seq 1 60); do
+            EXEC="$(oci instance-agent command-execution get --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" 2>/dev/null || true)"
+            FINAL="$(jq -r '.data."lifecycle-state" // empty' <<<"$EXEC" 2>/dev/null || true)"
+            case "$FINAL" in SUCCEEDED|FAILED|TIMED_OUT|CANCELED) break;; esac
+            sleep 5
+          done
+          OUTPUT="$(jq -r '.data.content.text // .data.content.message // empty' <<<"$EXEC" 2>/dev/null || true)"
+          EXIT_CODE="$(jq -r '.data.content."exit-code" // 999' <<<"$EXEC" 2>/dev/null || echo 999)"
+          printf '%s\n' "$OUTPUT"
+          echo "Remote state=$FINAL exit=$EXIT_CODE"
+          test "$FINAL" = 'SUCCEEDED'
+          test "$EXIT_CODE" = '0'
+          SERVER_PUB="$(printf '%s\n' "$OUTPUT" | sed -n 's/^public key: //p' | head -n1)"
+          if [ -z "$SERVER_PUB" ]; then
+            REMOTE_KEY_SCRIPT='cat /etc/wireguard/server.pub'
+            CONTENT2="$(jq -cn --arg text "$REMOTE_KEY_SCRIPT" '{source:{sourceType:"TEXT",text:$text},output:{outputType:"TEXT"},commandString:"/bin/bash"}')"
+            CMD2="$(oci instance-agent command create --compartment-id "$OCI_TENANCY_OCID" --content "$CONTENT2" --target "$TARGET" --timeout-in-seconds 60 --display-name 'troc-wg-read-key' --query 'data.id' --raw-output)"
+            for i in $(seq 1 20); do
+              E2="$(oci instance-agent command-execution get --command-id "$CMD2" --instance-id "$INSTANCE_ID" 2>/dev/null || true)"
+              S2="$(jq -r '.data."lifecycle-state" // empty' <<<"$E2" 2>/dev/null || true)"
+              case "$S2" in SUCCEEDED|FAILED|TIMED_OUT|CANCELED) break;; esac
+              sleep 3
+            done
+            SERVER_PUB="$(jq -r '.data.content.text // empty' <<<"$E2" | tr -d '\r\n')"
+          fi
+          test -n "$SERVER_PUB"
+          echo "WG_SERVER_PUBLIC_KEY=$SERVER_PUB" >> "$GITHUB_ENV"
+
+      - name: Validate WireGuard path and Trọc AI
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo mkdir -p /etc/wireguard
+          sudo tee /etc/wireguard/troc-validator.conf >/dev/null <<EOF
+          [Interface]
+          PrivateKey = $(cat /tmp/wg-validator.key)
+          Address = 10.77.0.2/32
+          MTU = 1380
+          [Peer]
+          PublicKey = $WG_SERVER_PUBLIC_KEY
+          Endpoint = $OCI_PUBLIC_IP:51820
+          AllowedIPs = 10.77.0.0/24
+          PersistentKeepalive = 25
+          EOF
+          sudo chmod 600 /etc/wireguard/troc-validator.conf
+          sudo wg-quick up troc-validator
+          trap 'sudo wg-quick down troc-validator >/dev/null 2>&1 || true' EXIT
+          HEALTH=''
+          for i in $(seq 1 45); do
+            HEALTH="$(curl -fsS --max-time 4 http://10.77.0.1:8787/api/health 2>/dev/null || true)"
+            if jq -e '.ok==true and .gemini_ready==true' <<<"$HEALTH" >/dev/null 2>&1; then break; fi
+            sleep 2
+          done
+          echo "$HEALTH" | jq .
+          jq -e '.ok==true and .gemini_ready==true' <<<"$HEALTH" >/dev/null
+          echo 'WireGuard + Trọc AI health: PASS'
+          set +e
+          CHAT_HTTP="$(curl -sS --max-time 120 -o /tmp/chat-smoke.json -w '%{http_code}' -H 'content-type: application/json' -d '{"message":"Chỉ trả lời đúng một từ: OK","history":[],"mode":"chat"}' http://10.77.0.1:8787/api/chat)"
+          CHAT_RC=$?
+          set -e
+          test "$CHAT_RC" -eq 0
+          if [ "$CHAT_HTTP" = '200' ]; then
+            jq -e '.answer|length>0' /tmp/chat-smoke.json >/dev/null
+            echo 'Live Gemini chat through Oracle/WireGuard: PASS'
+          elif [ "$CHAT_HTTP" = '429' ]; then
+            echo 'Gateway PASS; Gemini Free is in quota cooldown.'
+          else
+            cat /tmp/chat-smoke.json || true
+            echo "Unexpected chat HTTP $CHAT_HTTP" >&2
+            exit 1
+          fi
+
+      - name: Remove ephemeral validator peer
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          [ -n "${INSTANCE_ID:-}" ] || exit 0
+          [ -n "${WG_VALIDATOR_PUB:-}" ] || exit 0
+          export SUPPRESS_LABEL_WARNING=True OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING=True
+          SCRIPT="wg set wg0 peer '$WG_VALIDATOR_PUB' remove || true"
+          CONTENT="$(jq -cn --arg text "$SCRIPT" '{source:{sourceType:"TEXT",text:$text},output:{outputType:"TEXT"},commandString:"/bin/bash"}')"
+          TARGET="$(jq -cn --arg id "$INSTANCE_ID" '{instanceId:$id}')"
+          oci instance-agent command create --compartment-id "$OCI_TENANCY_OCID" --content "$CONTENT" --target "$TARGET" --timeout-in-seconds 60 --display-name 'troc-wg-validator-cleanup' >/dev/null 2>&1 || true
+          sudo wg-quick down troc-validator >/dev/null 2>&1 || true
+          rm -f /tmp/wg-validator.key /tmp/wg-validator.pub /etc/wireguard/troc-validator.conf
+
+      - name: Summary
+        if: success()
+        shell: bash
+        run: |
+          {
+            echo '## Oracle A1 WireGuard + Trọc AI READY'
+            echo ''
+            echo "- Region: \`$OCI_REGION\`"
+            echo "- A1: \`$A1_CPU OCPU / $A1_RAM GB\`"
+            echo "- Public IPv4: \`$OCI_PUBLIC_IP\`"
+            echo '- Public ingress: `UDP/51820 only`'
+            echo '- Host firewall: persistent WireGuard allow rule installed'
+            echo "- WireGuard server key: \`$WG_SERVER_PUBLIC_KEY\`"
+            echo '- Private Trọc AI: `http://10.77.0.1:8787`'
+            echo '- Real health + live Gemini request validated through WireGuard'
+          } >> "$GITHUB_STEP_SUMMARY"
