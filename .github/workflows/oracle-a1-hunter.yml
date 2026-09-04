@@ -18,11 +18,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 12
     env:
-      OCI_TENANCY_OCID: ${{ secrets.OCI_TENANCY_OCID }}
-      OCI_USER_OCID: ${{ secrets.OCI_USER_OCID }}
-      OCI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
+      OCI_CONFIG: ${{ secrets.OCI_CONFIG }}
       OCI_PRIVATE_KEY: ${{ secrets.OCI_PRIVATE_KEY }}
-      OCI_REGION: ${{ secrets.OCI_REGION }}
       OCI_SSH_PUBLIC_KEY: ${{ secrets.OCI_SSH_PUBLIC_KEY }}
       INSTANCE_NAME: troc-cloud-codex
       VCN_NAME: troc-codex-vcn
@@ -37,7 +34,7 @@ jobs:
         run: |
           set -euo pipefail
           missing=0
-          for v in OCI_TENANCY_OCID OCI_USER_OCID OCI_FINGERPRINT OCI_PRIVATE_KEY OCI_REGION OCI_SSH_PUBLIC_KEY; do
+          for v in OCI_CONFIG OCI_PRIVATE_KEY OCI_SSH_PUBLIC_KEY; do
             if [ -z "${!v:-}" ]; then
               echo "::warning::$v is not configured yet"
               missing=1
@@ -65,17 +62,25 @@ jobs:
           mkdir -p "$HOME/.oci"
           printf '%s\n' "$OCI_PRIVATE_KEY" > "$HOME/.oci/oci_api_key.pem"
           chmod 600 "$HOME/.oci/oci_api_key.pem"
-          cat > "$HOME/.oci/config" <<EOF
-          [DEFAULT]
-          user=$OCI_USER_OCID
-          fingerprint=$OCI_FINGERPRINT
-          tenancy=$OCI_TENANCY_OCID
-          region=$OCI_REGION
-          key_file=$HOME/.oci/oci_api_key.pem
-          EOF
+          printf '%s\n' "$OCI_CONFIG" > "$HOME/.oci/config"
+          sed -i "s#^key_file=.*#key_file=$HOME/.oci/oci_api_key.pem#" "$HOME/.oci/config"
           chmod 600 "$HOME/.oci/config"
-          oci iam region-subscription list --tenancy-id "$OCI_TENANCY_OCID" >/dev/null
-          echo "OCI authentication OK."
+
+          TENANCY_ID="$(awk -F= '/^tenancy=/{gsub(/[[:space:]]/,"",$2); print $2; exit}' "$HOME/.oci/config")"
+          REGION="$(awk -F= '/^region=/{gsub(/[[:space:]]/,"",$2); print $2; exit}' "$HOME/.oci/config")"
+          if [ -z "$TENANCY_ID" ]; then
+            echo "::error::OCI_CONFIG does not contain tenancy=."
+            exit 1
+          fi
+          if [ -z "$REGION" ]; then
+            REGION="ap-singapore-2"
+            echo "region=$REGION" >> "$HOME/.oci/config"
+          fi
+
+          echo "OCI_TENANCY_OCID=$TENANCY_ID" >> "$GITHUB_ENV"
+          echo "OCI_REGION=$REGION" >> "$GITHUB_ENV"
+          oci iam region-subscription list --tenancy-id "$TENANCY_ID" >/dev/null
+          echo "OCI authentication OK in $REGION."
 
       - name: Hunt A1 capacity
         if: steps.preflight.outputs.ready == 'true'
@@ -83,7 +88,6 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
-
           COMPARTMENT_ID="$OCI_TENANCY_OCID"
 
           active_instance() {
@@ -212,7 +216,6 @@ jobs:
             exit 1
           fi
           echo "Ubuntu image: $IMAGE_ID"
-
           METADATA="$(jq -cn --arg key "$OCI_SSH_PUBLIC_KEY" '{ssh_authorized_keys:$key}')"
 
           try_launch() {
@@ -220,8 +223,8 @@ jobs:
             local memory="$2"
             local cfg
             cfg="$(jq -cn --argjson c "$ocpus" --argjson m "$memory" '{ocpus:$c,memoryInGBs:$m}')"
-
             echo "Trying VM.Standard.A1.Flex: ${ocpus} OCPU / ${memory} GB ..."
+
             set +e
             output="$(oci compute instance launch \
               --compartment-id "$COMPARTMENT_ID" \
@@ -260,13 +263,8 @@ jobs:
             exit "$rc"
           }
 
-          if try_launch 2 12; then
-            exit 0
-          fi
-
-          if try_launch 1 6; then
-            exit 0
-          fi
+          if try_launch 2 12; then exit 0; fi
+          if try_launch 1 6; then exit 0; fi
 
           echo "success=false" >> "$GITHUB_OUTPUT"
           echo "No A1 capacity this hour. The next scheduled run will try again."
@@ -284,9 +282,7 @@ jobs:
             --query 'data[0]."vnic-id"' --raw-output)"
           PUBLIC_IP="$(oci network vnic get --vnic-id "$VNIC_ID" \
             --query 'data."public-ip"' --raw-output)"
-          echo "Oracle A1 is ready."
-          echo "Public IP: $PUBLIC_IP"
-          echo "SSH user: ubuntu"
+          echo "Oracle A1 is ready. Public IP: $PUBLIC_IP ; SSH user: ubuntu"
           {
             echo "## Oracle A1 acquired"
             echo ""
