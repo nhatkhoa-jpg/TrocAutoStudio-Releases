@@ -1,0 +1,157 @@
+name: Oracle A1 Serial SSH Rescue V5
+
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/oracle-a1-serial-ssh-rescue-v5.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  rescue:
+    runs-on: ubuntu-latest
+    timeout-minutes: 18
+    env:
+      OCI_CONFIG: ${{ secrets.OCI_CONFIG }}
+      OCI_PRIVATE_KEY: ${{ secrets.OCI_PRIVATE_KEY }}
+      EXPECTED_REGION: ap-singapore-2
+      INSTANCE_NAME: troc-cloud-codex
+    steps:
+      - name: Rescue existing A1 and prove private stack
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python -m pip install --disable-pip-version-check --quiet oci-cli
+          sudo apt-get update -qq && sudo apt-get install -y -qq expect wireguard-tools >/dev/null
+          mkdir -p "$HOME/.oci"
+          printf '%s\n' "$OCI_PRIVATE_KEY" > "$HOME/.oci/key.pem"
+          printf '%s\n' "$OCI_CONFIG" > "$HOME/.oci/config"
+          chmod 600 "$HOME/.oci/key.pem" "$HOME/.oci/config"
+          if grep -q '^key_file=' "$HOME/.oci/config"; then sed -i "s#^key_file=.*#key_file=$HOME/.oci/key.pem#" "$HOME/.oci/config"; else echo "key_file=$HOME/.oci/key.pem" >> "$HOME/.oci/config"; fi
+          export SUPPRESS_LABEL_WARNING=True OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING=True
+          T="$(awk -F= '/^tenancy=/{gsub(/[[:space:]]/,"",$2);print $2;exit}' "$HOME/.oci/config")"
+          R="$(awk -F= '/^region=/{gsub(/[[:space:]]/,"",$2);print $2;exit}' "$HOME/.oci/config")"; test "$R" = "$EXPECTED_REGION"
+          J="$(oci compute instance list --compartment-id "$T" --region "$R" --display-name "$INSTANCE_NAME" --all | jq -c '.data | sort_by(."time-created") | .[-1]')"; test "$J" != null
+          ID="$(jq -r '.id' <<<"$J")"; test "$(jq -r '.shape' <<<"$J")" = 'VM.Standard.A1.Flex'
+          awk -v v="$(jq -r '."shape-config".ocpus' <<<"$J")" 'BEGIN{exit !(v<=2)}'; awk -v v="$(jq -r '."shape-config"."memory-in-gbs"' <<<"$J")" 'BEGIN{exit !(v<=12)}'
+          AD="$(jq -r '."availability-domain"' <<<"$J")"; BV="$(oci compute boot-volume-attachment list --availability-domain "$AD" --compartment-id "$T" --instance-id "$ID" --region "$R" --all | jq -r '.data[0]."boot-volume-id"')"; test "$(oci bv boot-volume get --boot-volume-id "$BV" --region "$R" --query 'data."size-in-gbs"' --raw-output)" = 50
+          for i in $(seq 1 60); do STATE="$(oci compute instance get --instance-id "$ID" --region "$R" --query 'data."lifecycle-state"' --raw-output)"; [ "$STATE" = RUNNING ] && break; sleep 5; done; test "$STATE" = RUNNING
+          PUB="$(oci compute instance list-vnics --instance-id "$ID" --region "$R" | jq -r '.data[]|select(."is-primary"==true)|."public-ip"' | head -1)"; test -n "$PUB" && test "$PUB" != null
+          echo "A1_VALIDATED current_public_ip=$PUB"
+
+          VNIC="$(oci compute instance list-vnics --instance-id "$ID" --region "$R" | jq -r '.data[]|select(."is-primary"==true)|.id' | head -1)"; SUBNET="$(oci network vnic get --vnic-id "$VNIC" --region "$R" --query 'data."subnet-id"' --raw-output)"; SL="$(oci network subnet get --subnet-id "$SUBNET" --region "$R" --query 'data."security-list-ids"[0]' --raw-output)"
+          oci network security-list get --security-list-id "$SL" --region "$R" | jq '.data."ingress-security-rules"' >/tmp/original-ingress.json
+          jq -e '[.[] | select(.protocol=="6") | ((."tcp-options".destination."port-range".min // -1))] | (index(22)==null and index(8787)==null)' /tmp/original-ingress.json >/dev/null
+          jq -e '[.[] | select(.protocol=="17") | ((."udp-options".destination."port-range".min // -1))] | index(51820)!=null' /tmp/original-ingress.json >/dev/null
+
+          mapfile -t OLDCC < <(oci compute instance-console-connection list --compartment-id "$T" --instance-id "$ID" --region "$R" --all | jq -r '.data[]|select(."lifecycle-state"!="DELETED" and ."lifecycle-state"!="DELETING")|.id')
+          for cc in "${OLDCC[@]}"; do [ -n "$cc" ] && oci compute instance-console-connection delete --instance-console-connection-id "$cc" --region "$R" --force >/dev/null 2>&1 || true; done
+          sleep 3
+          ssh-keygen -q -t rsa -b 2048 -N '' -f /tmp/console_rsa
+          ssh-keygen -q -t ed25519 -N '' -C "troc-gh-rescue-${GITHUB_RUN_ID}" -f /tmp/a1_rescue
+          export RESCUE_PUB="$(cat /tmp/a1_rescue.pub)" ID R
+          CCJSON="$(oci compute instance-console-connection create --instance-id "$ID" --region "$R" --ssh-public-key-file /tmp/console_rsa.pub --wait-for-state ACTIVE --wait-interval-seconds 3)"; CCID="$(jq -r '.data.id' <<<"$CCJSON")"
+          cleanup(){ set +e; [ -n "${PUB:-}" ] && [ -s /tmp/a1_rescue ] && ssh -i /tmp/a1_rescue -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 ubuntu@"$PUB" "sudo sed -i '/troc-gh-rescue-/d' /home/ubuntu/.ssh/authorized_keys" >/dev/null 2>&1 || true; [ -n "${SL:-}" ] && [ -s /tmp/original-ingress.json ] && oci network security-list update --security-list-id "$SL" --region "$R" --ingress-security-rules file:///tmp/original-ingress.json --force >/dev/null 2>&1 || true; [ -n "${CCID:-}" ] && oci compute instance-console-connection delete --instance-console-connection-id "$CCID" --region "$R" --force >/dev/null 2>&1 || true; }
+          trap cleanup EXIT
+          cat >/tmp/connect-console.sh <<EOF
+          #!/usr/bin/env bash
+          exec ssh -tt -i /tmp/console_rsa -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o "ProxyCommand=ssh -i /tmp/console_rsa -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -W %h:%p -p 443 ${CCID}@instance-console.${R}.oci.oraclecloud.com" ${ID}
+          EOF
+          chmod 700 /tmp/connect-console.sh
+          cat >/tmp/rescue.exp <<'EXP'
+          set timeout 360
+          log_user 1
+          spawn /tmp/connect-console.sh
+          after 1800; send "\r"
+          expect { -re {login:} { puts "SERIAL_LOGIN_READY" } timeout { puts "FAIL_LOGIN"; exit 60 } }
+          exec bash -lc "oci compute instance action --instance-id '$env(ID)' --region '$env(R)' --action SOFTRESET >/dev/null 2>&1 &"
+          set front 0; set direct 0
+          for {set i 0} {$i < 450} {incr i} {
+            send "\033"; if {($i % 5) == 0} { send "\033\[15~" }; after 200
+            expect -timeout 0 {
+              -re {Please select boot device:} { set direct 1; puts "BOOT_DEVICE_LIST_OK"; break }
+              -re {Boot Manager} { set front 1; puts "UEFI_FRONT_MENU_OK"; break }
+              timeout {}
+            }
+          }
+          if {$front == 0 && $direct == 0} { puts "FAIL_NO_UEFI_MENU"; exit 61 }
+          if {$front == 1} { send "\033\[B"; after 200; send "\r"; after 700 }
+          set volume 0
+          for {set i 0} {$i < 60} {incr i} {
+            expect -timeout 0 {
+              -re {UEFI[^\r\n]*(Oracle|ORACLE|BlockVolume)|Oracle[^\r\n]*BlockVolume|BlockVolume} { set volume 1; puts "BLOCK_VOLUME_OK"; break }
+              timeout {}
+            }
+            after 200
+          }
+          if {$volume == 0} { puts "FAIL_NO_BLOCK_VOLUME"; exit 62 }
+          send "\r"
+          set grub 0
+          for {set i 0} {$i < 250} {incr i} {
+            send "\033"; after 120
+            expect -timeout 0 { -re {GNU GRUB|Advanced options for Ubuntu} { set grub 1; puts "GRUB_OK"; break } timeout {} }
+          }
+          if {$grub == 0} { puts "FAIL_GRUB"; exit 63 }
+          send "e"; after 700
+          set found 0
+          for {set i 0} {$i < 30} {incr i} {
+            expect -timeout 1 { -re {linux[[:space:]]+[^\r\n]*} { set found 1; puts "LINUX_LINE_OK"; break } timeout {} }
+            send "\016"; after 120
+          }
+          if {$found == 0} { puts "FAIL_LINUX_LINE"; exit 64 }
+          send "\005"; send " init=/bin/bash"; after 200; send "\030"
+          expect { -re {root@|bash-[0-9]|/#} { puts "ROOT_OK" } timeout { puts "FAIL_ROOT"; exit 65 } }
+          send "/bin/mount -o remount,rw /\r"; after 500
+          set key $env(RESCUE_PUB)
+          send "mkdir -p /home/ubuntu/.ssh; touch /home/ubuntu/.ssh/authorized_keys; sed -i '/troc-gh-rescue-/d' /home/ubuntu/.ssh/authorized_keys; echo '$key' >> /home/ubuntu/.ssh/authorized_keys; chown -R ubuntu:ubuntu /home/ubuntu/.ssh; chmod 700 /home/ubuntu/.ssh; chmod 600 /home/ubuntu/.ssh/authorized_keys; sync; echo RESCUE_KEY_OK\r"
+          expect { -re {RESCUE_KEY_OK} { puts "KEY_INSTALLED" } timeout { puts "FAIL_KEY"; exit 66 } }
+          send "exec /sbin/reboot -f\r"; after 3000; send "~."; expect eof
+          EXP
+          expect /tmp/rescue.exp
+          oci compute instance-console-connection delete --instance-console-connection-id "$CCID" --region "$R" --force >/dev/null 2>&1 || true; CCID=""
+
+          for i in $(seq 1 60); do STATE="$(oci compute instance get --instance-id "$ID" --region "$R" --query 'data."lifecycle-state"' --raw-output)"; [ "$STATE" = RUNNING ] && break; sleep 5; done; test "$STATE" = RUNNING
+          PUB="$(oci compute instance list-vnics --instance-id "$ID" --region "$R" | jq -r '.data[]|select(."is-primary"==true)|."public-ip"' | head -1)"
+          RUNNER_IP="$(curl -fsS --max-time 20 https://api.ipify.org)"; jq --arg src "$RUNNER_IP/32" '. + [{source:$src,protocol:"6",isStateless:false,tcpOptions:{destinationPortRange:{min:22,max:22}}}]' /tmp/original-ingress.json >/tmp/temp-ingress.json
+          oci network security-list update --security-list-id "$SL" --region "$R" --ingress-security-rules file:///tmp/temp-ingress.json --force >/dev/null
+          SSH=(-i /tmp/a1_rescue -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=8)
+          OK=0; for i in $(seq 1 35); do ssh "${SSH[@]}" ubuntu@"$PUB" 'echo SSH_OK' 2>/dev/null | grep -q SSH_OK && { OK=1; break; }; sleep 4; done; test "$OK" = 1
+          echo 'SSH_ACCESS_OK=1'
+          ssh "${SSH[@]}" ubuntu@"$PUB" 'sudo bash -s' <<'REMOTE'
+          set -Eeuo pipefail
+          systemctl is-active --quiet wg-quick@wg0; systemctl is-enabled --quiet wg-quick@wg0
+          systemctl is-active --quiet troc-ai.service; systemctl is-enabled --quiet troc-ai.service
+          ss -lun | grep -q ':51820 '; ss -ltn | grep -q '10.77.0.1:8787'
+          curl -fsS --max-time 10 http://10.77.0.1:8787/api/health | jq -e '.ok==true and .gemini_ready==true' >/dev/null
+          echo 'LOCAL_HEALTH_OK=1'; echo "WG_SERVER_PUBLIC_KEY=$(wg pubkey </etc/wireguard/server.key)"
+          wg show wg0 latest-handshakes | awk '{print "PHONE_HANDSHAKE=" ($2>0?"YES":"NO")}'
+          REMOTE
+          ssh "${SSH[@]}" ubuntu@"$PUB" "curl -fsS --max-time 120 -H 'content-type: application/json' -d '{\"message\":\"Chỉ trả lời đúng một từ: OK\",\"history\":[],\"mode\":\"chat\"}' http://10.77.0.1:8787/api/chat" | jq -e '(.answer // .reply // .text // "") | length>0' >/dev/null
+          echo 'LOCAL_GEMINI_SMOKE_OK=1'
+
+          umask 077; wg genkey >/tmp/test.key; wg pubkey </tmp/test.key >/tmp/test.pub; TPUB="$(cat /tmp/test.pub)"; SERVER_PUB="$(ssh "${SSH[@]}" ubuntu@"$PUB" 'sudo wg pubkey </etc/wireguard/server.key')"
+          ssh "${SSH[@]}" ubuntu@"$PUB" "sudo wg set wg0 peer '$TPUB' allowed-ips 10.77.0.2/32"
+          wgcleanup(){ set +e; sudo wg-quick down troc-a1-test >/dev/null 2>&1 || true; ssh "${SSH[@]}" ubuntu@"$PUB" "sudo wg set wg0 peer '$TPUB' remove" >/dev/null 2>&1 || true; }
+          trap 'wgcleanup; cleanup' EXIT
+          sudo tee /etc/wireguard/troc-a1-test.conf >/dev/null <<EOF
+          [Interface]
+          PrivateKey = $(cat /tmp/test.key)
+          Address = 10.77.0.2/32
+          [Peer]
+          PublicKey = $SERVER_PUB
+          Endpoint = $PUB:51820
+          AllowedIPs = 10.77.0.0/24
+          PersistentKeepalive = 25
+          EOF
+          sudo chmod 600 /etc/wireguard/troc-a1-test.conf; sudo wg-quick up troc-a1-test >/dev/null
+          HS=0; for i in $(seq 1 20); do HS="$(sudo wg show troc-a1-test latest-handshakes | awk '{print $2}')"; [ "${HS:-0}" -gt 0 ] 2>/dev/null && break; sleep 2; done; test "${HS:-0}" -gt 0
+          curl -fsS --max-time 10 http://10.77.0.1:8787/api/health | jq -e '.ok==true and .gemini_ready==true' >/dev/null
+          curl -fsS --max-time 120 -H 'content-type: application/json' -d '{"message":"Chỉ trả lời đúng một từ: OK","history":[],"mode":"chat"}' http://10.77.0.1:8787/api/chat | jq -e '(.answer // .reply // .text // "") | length>0' >/dev/null
+          echo 'VPN_E2E_OK handshake=YES health=YES gemini=YES'
+          wgcleanup
+          ssh "${SSH[@]}" ubuntu@"$PUB" "sudo sed -i '/troc-gh-rescue-/d' /home/ubuntu/.ssh/authorized_keys"
+          oci network security-list update --security-list-id "$SL" --region "$R" --ingress-security-rules file:///tmp/original-ingress.json --force >/dev/null
+          echo 'FINAL_CLEANUP_OK=1'
+          trap - EXIT; cleanup
