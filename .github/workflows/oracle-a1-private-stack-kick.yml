@@ -33,3 +33,6 @@ jobs:
           test -n "$RID"
           echo "Private stack run: $RID"
           gh run watch "$RID" --repo "$GITHUB_REPOSITORY" --exit-status
+
+      - name: Confirm direct path
+        run: echo 'Private-stack-only recovery path dispatched without compute lifecycle changes.'
