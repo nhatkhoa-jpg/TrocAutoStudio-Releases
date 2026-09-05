@@ -56,43 +56,31 @@ jobs:
         run: |
           set -Eeuo pipefail
           export SUPPRESS_LABEL_WARNING=True OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING=True
-
-          # Oracle documents that commands remaining ACCEPTED while the plugin appears
-          # RUNNING can be caused by the instance not being authorized to poll the
-          # command-execution family. Give only this exact instance that permission.
           RULE="instance.id = '$INSTANCE_ID'"
           DG_JSON="$(oci iam dynamic-group list --compartment-id "$TENANCY" --all)"
           DG_ID="$(jq -r --arg n "$RUNCOMMAND_DG_NAME" '.data[] | select(.name==$n and ."lifecycle-state"=="ACTIVE") | .id' <<<"$DG_JSON" | head -1)"
           if [ -z "$DG_ID" ]; then
-            echo 'Creating dedicated dynamic group for this exact A1...'
             DG_ID="$(oci iam dynamic-group create --compartment-id "$TENANCY" --name "$RUNCOMMAND_DG_NAME" --description 'Run Command polling permission for troc-cloud-codex only' --matching-rule "$RULE" --wait-for-state ACTIVE --query 'data.id' --raw-output)"
           else
             CURRENT_RULE="$(jq -r --arg n "$RUNCOMMAND_DG_NAME" '.data[] | select(.name==$n and ."lifecycle-state"=="ACTIVE") | ."matching-rule"' <<<"$DG_JSON" | head -1)"
             if [ "$CURRENT_RULE" != "$RULE" ]; then
-              echo 'Updating dynamic group to match only the current healthy A1...'
               oci iam dynamic-group update --dynamic-group-id "$DG_ID" --matching-rule "$RULE" --force >/dev/null
             fi
           fi
           test -n "$DG_ID"
-
           STATEMENT="Allow dynamic-group $RUNCOMMAND_DG_NAME to use instance-agent-command-execution-family in tenancy"
           P_JSON="$(oci iam policy list --compartment-id "$TENANCY" --all)"
           P_ID="$(jq -r --arg n "$RUNCOMMAND_POLICY_NAME" '.data[] | select(.name==$n and ."lifecycle-state"=="ACTIVE") | .id' <<<"$P_JSON" | head -1)"
           STATEMENTS="$(jq -cn --arg s "$STATEMENT" '[$s]')"
           if [ -z "$P_ID" ]; then
-            echo 'Creating least-privilege Run Command polling policy...'
             oci iam policy create --compartment-id "$TENANCY" --name "$RUNCOMMAND_POLICY_NAME" --description 'Allow troc-cloud-codex to consume its Run Commands' --statements "$STATEMENTS" --wait-for-state ACTIVE >/dev/null
           else
             CURRENT="$(jq -c --arg n "$RUNCOMMAND_POLICY_NAME" '.data[] | select(.name==$n and ."lifecycle-state"=="ACTIVE") | .statements' <<<"$P_JSON" | head -1)"
             if ! jq -e --arg s "$STATEMENT" 'index($s) != null' <<<"${CURRENT:-[]}" >/dev/null; then
-              echo 'Repairing Run Command polling policy statement...'
               oci iam policy update --policy-id "$P_ID" --statements "$STATEMENTS" --force >/dev/null
             fi
           fi
           echo RUNCOMMAND_IAM_READY=1
-
-          # IAM changes are eventually consistent. Give OCI a short propagation window;
-          # the following soft reset restarts Oracle Cloud Agent without recreating A1.
           sleep 60
 
       - name: Drain stale accepted Run Commands
@@ -100,7 +88,10 @@ jobs:
         run: |
           set -Eeuo pipefail
           export SUPPRESS_LABEL_WARNING=True OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING=True
-          EXECS="$(oci instance-agent command-execution list --compartment-id "$TENANCY" --instance-id "$INSTANCE_ID" --region "$REGION" --lifecycle-state ACCEPTED --all)"
+          # Do not use --all here. OCI's command-execution endpoint can return an
+          # invalid next-page token for filtered ACCEPTED results; one page is enough
+          # for this recovery queue and avoids the CLI auto-pagination failure.
+          EXECS="$(oci instance-agent command-execution list --compartment-id "$TENANCY" --instance-id "$INSTANCE_ID" --region "$REGION" --lifecycle-state ACCEPTED --limit 100)"
           COUNT="$(jq '.data|length' <<<"$EXECS")"
           echo "STALE_ACCEPTED_COUNT=$COUNT"
           mapfile -t CMDS < <(jq -r '.data[] | ."instance-agent-command-id" // ."command-id" // empty' <<<"$EXECS" | sort -u)
@@ -110,7 +101,7 @@ jobs:
             oci instance-agent command cancel --command-id "$C" --region "$REGION" --force >/dev/null 2>&1 || true
           done
           sleep 15
-          LEFT="$(oci instance-agent command-execution list --compartment-id "$TENANCY" --instance-id "$INSTANCE_ID" --region "$REGION" --lifecycle-state ACCEPTED --all | jq '.data|length')"
+          LEFT="$(oci instance-agent command-execution list --compartment-id "$TENANCY" --instance-id "$INSTANCE_ID" --region "$REGION" --lifecycle-state ACCEPTED --limit 100 | jq '.data|length')"
           echo "STALE_ACCEPTED_AFTER_CANCEL=$LEFT"
 
       - name: Re-enable plugin and soft-reset existing A1 only
