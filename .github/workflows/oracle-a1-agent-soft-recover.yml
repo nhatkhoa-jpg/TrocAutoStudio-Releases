@@ -24,7 +24,7 @@ jobs:
       INSTANCE_NAME: troc-cloud-codex
       EXPECTED_SHAPE: VM.Standard.A1.Flex
     steps:
-      - name: Validate exact A1 and soft reboot only
+      - name: Validate exact A1, enable Run Command and soft reboot only
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -36,7 +36,7 @@ jobs:
           printf '%s\n' "$OCI_CONFIG" > "$HOME/.oci/config"
           if grep -q '^key_file=' "$HOME/.oci/config"; then sed -i "s#^key_file=.*#key_file=$HOME/.oci/key.pem#" "$HOME/.oci/config"; else echo "key_file=$HOME/.oci/key.pem" >> "$HOME/.oci/config"; fi
           chmod 600 "$HOME/.oci/config"
-          trap 'rm -f "$HOME/.oci/key.pem" "$HOME/.oci/config"' EXIT
+          trap 'rm -f "$HOME/.oci/key.pem" "$HOME/.oci/config" /tmp/agent-config.json' EXIT
           export SUPPRESS_LABEL_WARNING=True OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING=True
           T="$(awk -F= '/^tenancy=/{gsub(/[[:space:]]/,"",$2);print $2;exit}' "$HOME/.oci/config")"
           R="$(awk -F= '/^region=/{gsub(/[[:space:]]/,"",$2);print $2;exit}' "$HOME/.oci/config")"
@@ -48,18 +48,34 @@ jobs:
           CPU="$(jq -r '."shape-config".ocpus' <<<"$J")"
           RAM="$(jq -r '."shape-config"."memory-in-gbs"' <<<"$J")"
           test "$SHAPE" = "$EXPECTED_SHAPE"
-          awk -v v="$CPU" 'BEGIN{exit !(v<=2)}'
-          awk -v v="$RAM" 'BEGIN{exit !(v<=12)}'
+          awk -v v="$CPU" 'BEGIN{exit !(v==2)}'
+          awk -v v="$RAM" 'BEGIN{exit !(v==12)}'
           BV="$(oci compute boot-volume-attachment list --availability-domain "$(jq -r '."availability-domain"' <<<"$J")" --compartment-id "$T" --instance-id "$ID" --region "$R" --all | jq -r '.data[0]."boot-volume-id"')"
           test -n "$BV" && test "$BV" != null
           SIZE="$(oci bv boot-volume get --boot-volume-id "$BV" --region "$R" --query 'data."size-in-gbs"' --raw-output)"
           test "$SIZE" = "50"
           echo "Validated exact bounded A1: shape=$SHAPE cpu=$CPU ram_gb=$RAM boot_gb=$SIZE"
+
+          # Explicitly enable the Oracle Cloud Agent management plane and Run Command plugin.
+          # This is a control-plane-only change; it does not recreate, terminate or resize the A1.
+          cat >/tmp/agent-config.json <<'JSON'
+          {
+            "isManagementDisabled": false,
+            "areAllPluginsDisabled": false,
+            "pluginsConfig": [
+              {"name": "Compute Instance Run Command", "desiredState": "ENABLED"}
+            ]
+          }
+          JSON
+          oci compute instance update --instance-id "$ID" --region "$R" --agent-config file:///tmp/agent-config.json --force >/dev/null
+          echo 'Run Command desiredState forced to ENABLED; management plugins enabled.'
+
           echo "Issuing SOFTRESET only; no terminate/recreate/update-shape commands exist in this workflow."
           oci compute instance action --instance-id "$ID" --region "$R" --action SOFTRESET --wait-for-state RUNNING --wait-interval-seconds 5 >/dev/null
           sleep 35
           echo 'Waiting for Run Command plugin to report RUNNING after reboot...'
-          for i in $(seq 1 24); do
+          ST=''
+          for i in $(seq 1 30); do
             ST="$(oci instance-agent plugin list --compartment-id "$T" --instanceagent-id "$ID" --region "$R" --all | jq -r '.data[]|select(.name=="Compute Instance Run Command")|.status' | head -1)"
             echo "agent_check=$i status=${ST:-missing}"
             [ "$ST" = RUNNING ] && break
@@ -74,9 +90,7 @@ jobs:
         run: |
           set -Eeuo pipefail
           export SUPPRESS_LABEL_WARNING=True OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING=True
-          T="$(awk -F= '/^tenancy=/{gsub(/[[:space:]]/,"",$2);print $2;exit}' "$HOME/.oci/config" 2>/dev/null || true)"
           R="$EXPECTED_REGION"
-          # Recreate transient OCI files because prior step trap removes them.
           mkdir -p "$HOME/.oci"
           printf '%s\n' "$OCI_PRIVATE_KEY" > "$HOME/.oci/key.pem"; chmod 600 "$HOME/.oci/key.pem"
           printf '%s\n' "$OCI_CONFIG" > "$HOME/.oci/config"
@@ -84,16 +98,20 @@ jobs:
           chmod 600 "$HOME/.oci/config"
           trap 'rm -f "$HOME/.oci/key.pem" "$HOME/.oci/config" /tmp/out.txt' EXIT
           T="$(awk -F= '/^tenancy=/{gsub(/[[:space:]]/,"",$2);print $2;exit}' "$HOME/.oci/config")"
-          ID="$(oci compute instance list --compartment-id "$T" --region "$R" --display-name "$INSTANCE_NAME" --all | jq -r '[.data[]|select(."lifecycle-state"=="RUNNING" and .shape=="VM.Standard.A1.Flex" and ."shape-config".ocpus<=2 and ."shape-config"."memory-in-gbs"<=12)]|sort_by(."time-created")|last|.id//empty')"
+          ID="$(oci compute instance list --compartment-id "$T" --region "$R" --display-name "$INSTANCE_NAME" --all | jq -r '[.data[]|select(."lifecycle-state"=="RUNNING" and .shape=="VM.Standard.A1.Flex" and ."shape-config".ocpus==2 and ."shape-config"."memory-in-gbs"==12)]|sort_by(."time-created")|last|.id//empty')"
           test -n "$ID"
-          CMD="$(oci instance-agent command create --region "$R" --compartment-id "$T" --target '{"instanceId":"'"$ID"'"}' --content '{"source":{"sourceType":"TEXT","text":"set -eu; echo GUEST_OK; uname -m; systemctl is-system-running || true"}}' --display-name 'troc-a1-post-reboot-probe' --query 'data.id' --raw-output)"
+          CMD="$(oci instance-agent command create --region "$R" --compartment-id "$T" --target '{"instanceId":"'"$ID"'"}' --content '{"source":{"sourceType":"TEXT","text":"set -eu; echo GUEST_OK; uname -m; systemctl is-system-running || true"},"output":{"outputType":"TEXT"},"commandString":"/bin/bash"}' --timeout-in-seconds 180 --display-name 'troc-a1-post-reboot-probe' --query 'data.id' --raw-output)"
           test -n "$CMD" && test "$CMD" != null
           STATE=''
-          for i in $(seq 1 30); do
-            STATE="$(oci instance-agent command-execution get --instance-agent-command-id "$CMD" --instance-id "$ID" --region "$R" --query 'data."lifecycle-state"' --raw-output 2>/dev/null || true)"
+          EXEC=''
+          for i in $(seq 1 48); do
+            EXEC="$(oci instance-agent command-execution get --instance-agent-command-id "$CMD" --instance-id "$ID" --region "$R" 2>/dev/null || true)"
+            STATE="$(jq -r '.data."lifecycle-state" // empty' <<<"$EXEC" 2>/dev/null || true)"
             echo "command_check=$i state=${STATE:-unknown}"
             case "$STATE" in SUCCEEDED|FAILED|CANCELED|TIMED_OUT) break;; esac
             sleep 5
           done
+          OUT="$(jq -r '.data.content.output // .data.content.text // empty' <<<"$EXEC" 2>/dev/null | base64 -d 2>/dev/null || true)"
+          printf '%s\n' "$OUT" | sed -E 's/((token|secret|private.?key|gemini_api_key)[=:])[[:graph:]]+/\1[REDACTED]/Ig'
           test "$STATE" = SUCCEEDED
-          oci instance-agent command-execution get --instance-agent-command-id "$CMD" --instance-id "$ID" --region "$R" --query 'data.content.output' --raw-output | base64 -d 2>/dev/null | sed -E 's/((token|secret|key)[=:])[[:graph:]]+/\1[REDACTED]/Ig' || true
+          grep -q 'GUEST_OK' <<<"$OUT"
