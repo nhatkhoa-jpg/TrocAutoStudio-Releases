@@ -1,0 +1,139 @@
+name: Oracle A1 Finish V2
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/oracle-a1-finish-v2.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: oracle-a1-finish-v2
+  cancel-in-progress: false
+
+jobs:
+  finish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    env:
+      OCI_CONFIG: ${{ secrets.OCI_CONFIG }}
+      OCI_PRIVATE_KEY: ${{ secrets.OCI_PRIVATE_KEY }}
+      EXPECTED_REGION: ap-singapore-2
+      INSTANCE_NAME: troc-cloud-codex
+      EXPECTED_SHAPE: VM.Standard.A1.Flex
+      EXPECTED_OCPUS: '2'
+      EXPECTED_MEMORY: '12'
+      PUBLIC_RT_NAME: troc-codex-public-rt
+      PUBLIC_SL_NAME: troc-codex-public-sl
+      IGW_NAME: troc-codex-igw
+
+    steps:
+      - name: Configure OCI and validate healthy replacement
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          test -n "$OCI_CONFIG" && test -n "$OCI_PRIVATE_KEY"
+          python -m pip install --disable-pip-version-check --quiet oci-cli
+          mkdir -p "$HOME/.oci"
+          printf '%s\n' "$OCI_PRIVATE_KEY" > "$HOME/.oci/key.pem"
+          chmod 600 "$HOME/.oci/key.pem"
+          printf '%s\n' "$OCI_CONFIG" > "$HOME/.oci/config"
+          if grep -q '^key_file=' "$HOME/.oci/config"; then sed -i "s#^key_file=.*#key_file=$HOME/.oci/key.pem#" "$HOME/.oci/config"; else echo "key_file=$HOME/.oci/key.pem" >> "$HOME/.oci/config"; fi
+          chmod 600 "$HOME/.oci/config"
+          T="$(awk -F= '/^tenancy=/{gsub(/[[:space:]]/,"",$2);print $2;exit}' "$HOME/.oci/config")"
+          R="$(awk -F= '/^region=/{gsub(/[[:space:]]/,"",$2);print $2;exit}' "$HOME/.oci/config")"
+          test -n "$T" && test "$R" = "$EXPECTED_REGION"
+          J="$(oci compute instance list --compartment-id "$T" --region "$R" --display-name "$INSTANCE_NAME" --all | jq -c '[.data[]|select(."lifecycle-state"=="RUNNING")]|sort_by(."time-created")|last')"
+          test "$J" != null
+          ID="$(jq -r '.id' <<<"$J")"; SH="$(jq -r '.shape' <<<"$J")"; CPU="$(jq -r '."shape-config".ocpus' <<<"$J")"; RAM="$(jq -r '."shape-config"."memory-in-gbs"' <<<"$J")"
+          test "$SH" = "$EXPECTED_SHAPE"
+          awk -v v="$CPU" -v e="$EXPECTED_OCPUS" 'BEGIN{exit !(v==e)}'
+          awk -v v="$RAM" -v e="$EXPECTED_MEMORY" 'BEGIN{exit !(v==e)}'
+          echo "OCI_TENANCY=$T" >> "$GITHUB_ENV"; echo "OCI_REGION=$R" >> "$GITHUB_ENV"; echo "INSTANCE_ID=$ID" >> "$GITHUB_ENV"
+          echo "Validated healthy A1: $ID shape=$SH cpu=$CPU ram=$RAM"
+
+      - name: Attach existing private perimeter without mutating public-IP policy
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          VNIC="$(oci compute instance list-vnics --instance-id "$INSTANCE_ID" --region "$OCI_REGION" | jq -r '.data[]|select(."is-primary"==true)|.id' | head -1)"
+          test -n "$VNIC"
+          VNIC_JSON="$(oci network vnic get --vnic-id "$VNIC" --region "$OCI_REGION")"
+          SUBNET="$(jq -r '.data."subnet-id"' <<<"$VNIC_JSON")"
+          PUB="$(jq -r '.data."public-ip"' <<<"$VNIC_JSON")"
+          test -n "$PUB" && test "$PUB" != null
+          VCN="$(oci network subnet get --subnet-id "$SUBNET" --region "$OCI_REGION" --query 'data."vcn-id"' --raw-output)"
+          IGW="$(oci network internet-gateway list --compartment-id "$OCI_TENANCY" --region "$OCI_REGION" --vcn-id "$VCN" --all | jq -r --arg n "$IGW_NAME" '[.data[]|select(."display-name"==$n and ."lifecycle-state"=="AVAILABLE")][0].id // empty')"
+          RT="$(oci network route-table list --compartment-id "$OCI_TENANCY" --region "$OCI_REGION" --vcn-id "$VCN" --all | jq -r --arg n "$PUBLIC_RT_NAME" '[.data[]|select(."display-name"==$n and ."lifecycle-state"=="AVAILABLE")][0].id // empty')"
+          SL="$(oci network security-list list --compartment-id "$OCI_TENANCY" --region "$OCI_REGION" --vcn-id "$VCN" --all | jq -r --arg n "$PUBLIC_SL_NAME" '[.data[]|select(."display-name"==$n and ."lifecycle-state"=="AVAILABLE")][0].id // empty')"
+          test -n "$IGW" && test -n "$RT" && test -n "$SL"
+
+          RULES="$(jq -cn --arg igw "$IGW" '[{cidrBlock:"0.0.0.0/0",networkEntityId:$igw}]')"
+          oci network route-table update --region "$OCI_REGION" --rt-id "$RT" --route-rules "$RULES" --force >/dev/null
+          INGRESS='[{"source":"0.0.0.0/0","protocol":"17","isStateless":false,"udpOptions":{"destinationPortRange":{"min":51820,"max":51820}}}]'
+          EGRESS='[{"destination":"0.0.0.0/0","protocol":"all","isStateless":false}]'
+          oci network security-list update --region "$OCI_REGION" --security-list-id "$SL" --ingress-security-rules "$INGRESS" --egress-security-rules "$EGRESS" --force >/dev/null
+          SLIDS="$(jq -cn --arg id "$SL" '[$id]')"
+          # Critical fix: do NOT pass --prohibit-public-ip-on-vnic here. That flag caused the old workflow's UsageError.
+          oci network subnet update --region "$OCI_REGION" --subnet-id "$SUBNET" --route-table-id "$RT" --security-list-ids "$SLIDS" --force >/dev/null
+
+          VERIFY="$(oci network subnet get --subnet-id "$SUBNET" --region "$OCI_REGION")"
+          jq -e --arg rt "$RT" --arg sl "$SL" '.data."route-table-id"==$rt and (.data."security-list-ids"|index($sl)!=null)' <<<"$VERIFY" >/dev/null
+          PUB2="$(oci network vnic get --vnic-id "$VNIC" --region "$OCI_REGION" --query 'data."public-ip"' --raw-output)"
+          test "$PUB2" = "$PUB"
+          echo "PUBLIC_IP=$PUB" >> "$GITHUB_ENV"
+          echo "Perimeter attached safely; public IP preserved: $PUB"
+
+      - name: Wait for Oracle Run Command agent
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          for i in $(seq 1 60); do
+            P="$(oci instance-agent plugin list --compartment-id "$OCI_TENANCY" --instanceagent-id "$INSTANCE_ID" --region "$OCI_REGION" --all 2>/dev/null || true)"
+            S="$(jq -r '[.data[]? | select((.name|ascii_downcase|contains("run")) and (.name|ascii_downcase|contains("command")))][0].status // empty' <<<"$P" 2>/dev/null || true)"
+            if [ "$S" = RUNNING ]; then echo 'Run Command agent is RUNNING'; exit 0; fi
+            echo "agent_wait=$i status=${S:-unknown}"
+            sleep 10
+          done
+          echo '::error::Run Command agent did not become RUNNING'
+          exit 1
+
+      - name: Dispatch private Trọc AI stack deploy
+        id: deploy
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          before="$(gh run list --repo "$GITHUB_REPOSITORY" --workflow oracle-a1-private-stack-deploy.yml --limit 1 --json databaseId --jq '.[0].databaseId // 0')"
+          gh workflow run oracle-a1-private-stack-deploy.yml --repo "$GITHUB_REPOSITORY" --ref main
+          run=''
+          for i in $(seq 1 30); do
+            run="$(gh run list --repo "$GITHUB_REPOSITORY" --workflow oracle-a1-private-stack-deploy.yml --limit 1 --json databaseId --jq '.[0].databaseId // 0')"
+            [ "$run" != "$before" ] && [ "$run" != 0 ] && break
+            sleep 2
+          done
+          test -n "$run" && [ "$run" != 0 ] && [ "$run" != "$before" ]
+          echo "Private stack run: $run"
+          gh run watch "$run" --repo "$GITHUB_REPOSITORY" --exit-status
+          echo "run_id=$run" >> "$GITHUB_OUTPUT"
+
+      - name: Final summary
+        shell: bash
+        run: |
+          {
+            echo '## Oracle A1 Finish V2 — DONE'
+            echo "- A1: RUNNING, 2 OCPU / 12 GB"
+            echo "- Public IP: $PUBLIC_IP"
+            echo '- Public perimeter attached: UDP/51820 only on dedicated security list'
+            echo '- Private stack deploy completed successfully, including WireGuard, Trọc AI health and Gemini chat smoke test'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Cleanup OCI credentials
+        if: always()
+        shell: bash
+        run: rm -f "$HOME/.oci/key.pem" "$HOME/.oci/config"
