@@ -1,0 +1,86 @@
+name: GitHub storage maintenance
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/storage-maintenance.yml'
+  schedule:
+    - cron: '41 4 * * 0'
+
+permissions:
+  actions: write
+  contents: write
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Purge stale caches and old OTA releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          python - <<'PY'
+          import datetime as dt, json, os, re, urllib.error, urllib.parse, urllib.request
+
+          token=os.environ['GH_TOKEN']; repo=os.environ['REPO']; event=os.environ['EVENT']
+          headers={'Authorization':f'Bearer {token}','Accept':'application/vnd.github+json','X-GitHub-Api-Version':'2022-11-28'}
+
+          def get_json(url):
+              req=urllib.request.Request(url,headers=headers)
+              with urllib.request.urlopen(req) as r: return json.load(r)
+
+          def delete(url):
+              req=urllib.request.Request(url,headers=headers,method='DELETE')
+              try:
+                  urllib.request.urlopen(req).read(); return True
+              except urllib.error.HTTPError as e:
+                  if e.code == 404: return False
+                  raise
+
+          # Actions caches are disposable. First installation does a full purge;
+          # scheduled runs only remove caches untouched for 7 days.
+          caches=[]; page=1
+          while True:
+              data=get_json(f'https://api.github.com/repos/{repo}/actions/caches?per_page=100&page={page}')
+              batch=data.get('actions_caches',[]); caches += batch
+              if len(batch)<100: break
+              page += 1
+          cutoff=dt.datetime.now(dt.timezone.utc)-dt.timedelta(days=7)
+          cache_deleted=cache_bytes=0
+          for c in caches:
+              last=dt.datetime.fromisoformat(c['last_accessed_at'].replace('Z','+00:00'))
+              if event=='push' or last < cutoff:
+                  if delete(f"https://api.github.com/repos/{repo}/actions/caches/{c['id']}"):
+                      cache_deleted += 1; cache_bytes += int(c.get('size_in_bytes') or 0)
+          print(f'caches={len(caches)} deleted={cache_deleted} bytes_freed={cache_bytes}')
+
+          # OTA release repo: keep 5 newest releases, plus named safety anchors.
+          releases=[]; page=1
+          while True:
+              batch=get_json(f'https://api.github.com/repos/{repo}/releases?per_page=100&page={page}')
+              releases += batch
+              if len(batch)<100: break
+              page += 1
+          releases.sort(key=lambda r:(r.get('published_at') or r.get('created_at') or ''), reverse=True)
+          protected_ids={r['id'] for r in releases[:5]}
+          protect=re.compile(r'(stable|final|bootstrap|production|prod)', re.I)
+          for r in releases:
+              if protect.search(r.get('tag_name','')) or protect.search(r.get('name') or ''):
+                  protected_ids.add(r['id'])
+
+          rel_deleted=rel_bytes=0
+          for r in releases:
+              if r['id'] in protected_ids: continue
+              rel_bytes += sum(int(a.get('size') or 0) for a in r.get('assets',[]))
+              tag=r.get('tag_name','')
+              if delete(f"https://api.github.com/repos/{repo}/releases/{r['id']}"):
+                  rel_deleted += 1
+                  if tag:
+                      delete(f"https://api.github.com/repos/{repo}/git/refs/tags/{urllib.parse.quote(tag, safe='')}")
+                  print('deleted_release', tag)
+          print(f'releases={len(releases)} kept={len(releases)-rel_deleted} deleted={rel_deleted} asset_bytes_freed={rel_bytes}')
+          PY
