@@ -56,8 +56,6 @@ jobs:
           test "$SIZE" = "50"
           echo "Validated exact bounded A1: shape=$SHAPE cpu=$CPU ram_gb=$RAM boot_gb=$SIZE"
 
-          # Explicitly enable the Oracle Cloud Agent management plane and Run Command plugin.
-          # This is a control-plane-only change; it does not recreate, terminate or resize the A1.
           cat >/tmp/agent-config.json <<'JSON'
           {
             "isManagementDisabled": false,
@@ -96,7 +94,7 @@ jobs:
           printf '%s\n' "$OCI_CONFIG" > "$HOME/.oci/config"
           if grep -q '^key_file=' "$HOME/.oci/config"; then sed -i "s#^key_file=.*#key_file=$HOME/.oci/key.pem#" "$HOME/.oci/config"; else echo "key_file=$HOME/.oci/key.pem" >> "$HOME/.oci/config"; fi
           chmod 600 "$HOME/.oci/config"
-          trap 'rm -f "$HOME/.oci/key.pem" "$HOME/.oci/config" /tmp/out.txt' EXIT
+          trap 'rm -f "$HOME/.oci/key.pem" "$HOME/.oci/config"' EXIT
           T="$(awk -F= '/^tenancy=/{gsub(/[[:space:]]/,"",$2);print $2;exit}' "$HOME/.oci/config")"
           ID="$(oci compute instance list --compartment-id "$T" --region "$R" --display-name "$INSTANCE_NAME" --all | jq -r '[.data[]|select(."lifecycle-state"=="RUNNING" and .shape=="VM.Standard.A1.Flex" and ."shape-config".ocpus==2 and ."shape-config"."memory-in-gbs"==12)]|sort_by(."time-created")|last|.id//empty')"
           test -n "$ID"
@@ -105,7 +103,7 @@ jobs:
           STATE=''
           EXEC=''
           for i in $(seq 1 48); do
-            EXEC="$(oci instance-agent command-execution get --instance-agent-command-id "$CMD" --instance-id "$ID" --region "$R" 2>/dev/null || true)"
+            EXEC="$(oci instance-agent command-execution get --command-id "$CMD" --instance-id "$ID" --region "$R" 2>/dev/null || true)"
             STATE="$(jq -r '.data."lifecycle-state" // empty' <<<"$EXEC" 2>/dev/null || true)"
             echo "command_check=$i state=${STATE:-unknown}"
             case "$STATE" in SUCCEEDED|FAILED|CANCELED|TIMED_OUT) break;; esac
