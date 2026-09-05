@@ -1,0 +1,166 @@
+name: Oracle A1 Fast Finish
+
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/oracle-a1-fast-finish.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: oracle-a1-fast-finish
+  cancel-in-progress: true
+
+jobs:
+  finish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      OCI_CONFIG: ${{ secrets.OCI_CONFIG }}
+      OCI_PRIVATE_KEY: ${{ secrets.OCI_PRIVATE_KEY }}
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      REGION: ap-singapore-2
+      INSTANCE_NAME: troc-cloud-codex
+      PHONE_WG_PUBLIC_KEY: nhJ3KKQ1i2SnbXVzYP6Jopt1KBaYnEk8ykV8DAMozww=
+      TROC_AI_MODEL: gemini-2.5-flash-lite
+    steps:
+      - name: Configure OCI and validate healthy A1
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          test -n "$OCI_CONFIG" && test -n "$OCI_PRIVATE_KEY" && test -n "$GEMINI_API_KEY"
+          timeout 180 python -m pip install --disable-pip-version-check --quiet --prefer-binary oci-cli
+          mkdir -p "$HOME/.oci"
+          printf '%s\n' "$OCI_PRIVATE_KEY" > "$HOME/.oci/key.pem"; chmod 600 "$HOME/.oci/key.pem"
+          printf '%s\n' "$OCI_CONFIG" > "$HOME/.oci/config"
+          if grep -q '^key_file=' "$HOME/.oci/config"; then sed -i "s#^key_file=.*#key_file=$HOME/.oci/key.pem#" "$HOME/.oci/config"; else echo "key_file=$HOME/.oci/key.pem" >> "$HOME/.oci/config"; fi
+          chmod 600 "$HOME/.oci/config"
+          T="$(awk -F= '/^tenancy=/{gsub(/[[:space:]]/,"",$2);print $2;exit}' "$HOME/.oci/config")"
+          R="$(awk -F= '/^region=/{gsub(/[[:space:]]/,"",$2);print $2;exit}' "$HOME/.oci/config")"
+          test -n "$T" && test "$R" = "$REGION"
+          J="$(oci compute instance list --compartment-id "$T" --region "$R" --display-name "$INSTANCE_NAME" --all | jq -c '[.data[]|select(."lifecycle-state"=="RUNNING")]|sort_by(."time-created")|last')"
+          test "$J" != null
+          ID="$(jq -r '.id' <<<"$J")"; SH="$(jq -r '.shape' <<<"$J")"; CPU="$(jq -r '."shape-config".ocpus' <<<"$J")"; RAM="$(jq -r '."shape-config"."memory-in-gbs"' <<<"$J")"
+          test "$SH" = VM.Standard.A1.Flex; test "$CPU" = 2; test "$RAM" = 12
+          AD="$(jq -r '."availability-domain"' <<<"$J")"
+          BV="$(oci compute boot-volume-attachment list --availability-domain "$AD" --compartment-id "$T" --instance-id "$ID" --region "$R" --all | jq -r '.data[0]."boot-volume-id"')"
+          SIZE="$(oci bv boot-volume get --boot-volume-id "$BV" --region "$R" --query 'data."size-in-gbs"' --raw-output)"; test "$SIZE" = 50
+          PUB="$(oci compute instance list-vnics --instance-id "$ID" --region "$R" | jq -r '.data[]|select(."is-primary"==true)|."public-ip"' | head -1)"
+          echo "TENANCY=$T" >> "$GITHUB_ENV"; echo "INSTANCE_ID=$ID" >> "$GITHUB_ENV"; echo "PUBLIC_IP=$PUB" >> "$GITHUB_ENV"
+          echo "Validated existing A1 only: 2 OCPU / 12 GB / 50 GB, IP=$PUB"
+
+      - name: Recover Oracle Run Command safely
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          cat >/tmp/agent.json <<'JSON'
+          {"isManagementDisabled":false,"areAllPluginsDisabled":false,"pluginsConfig":[{"name":"Compute Instance Run Command","desiredState":"ENABLED"}]}
+          JSON
+          oci compute instance update --instance-id "$INSTANCE_ID" --region "$REGION" --agent-config file:///tmp/agent.json --force >/dev/null
+          oci compute instance action --instance-id "$INSTANCE_ID" --region "$REGION" --action SOFTRESET --wait-for-state RUNNING --wait-interval-seconds 5 >/dev/null
+          sleep 35
+          for i in $(seq 1 30); do
+            ST="$(oci instance-agent plugin list --compartment-id "$TENANCY" --instanceagent-id "$INSTANCE_ID" --region "$REGION" --all | jq -r '.data[]|select(.name=="Compute Instance Run Command")|.status' | head -1)"
+            echo "agent_check=$i status=${ST:-missing}"
+            [ "$ST" = RUNNING ] && break
+            sleep 10
+          done
+          test "${ST:-}" = RUNNING
+
+      - name: Prove guest command consumed
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          C="$(oci instance-agent command create --region "$REGION" --compartment-id "$TENANCY" --target '{"instanceId":"'"$INSTANCE_ID"'"}' --content '{"source":{"sourceType":"TEXT","text":"echo GUEST_OK"},"output":{"outputType":"TEXT"},"commandString":"/bin/bash"}' --timeout-in-seconds 120 --display-name fast-finish-probe --query 'data.id' --raw-output)"
+          for i in $(seq 1 30); do
+            E="$(oci instance-agent command-execution get --command-id "$C" --instance-id "$INSTANCE_ID" --region "$REGION" 2>/dev/null || true)"; S="$(jq -r '.data."lifecycle-state" // empty' <<<"$E" 2>/dev/null || true)"; echo "probe=$i state=${S:-unknown}"; case "$S" in SUCCEEDED|FAILED|TIMED_OUT|CANCELED) break;; esac; sleep 4
+          done
+          test "$S" = SUCCEEDED
+          O="$(jq -r '.data.content.output // empty' <<<"$E" 2>/dev/null | base64 -d 2>/dev/null || jq -r '.data.content.text // empty' <<<"$E" 2>/dev/null || true)"
+          grep -q GUEST_OK <<<"$O"
+
+      - name: Deploy WireGuard and troc-ai
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          KB="$(printf '%s' "$GEMINI_API_KEY" | base64 -w0)"; PB="$(printf '%s' "$PHONE_WG_PUBLIC_KEY" | base64 -w0)"; MB="$(printf '%s' "$TROC_AI_MODEL" | base64 -w0)"
+          cat >/tmp/remote.sh <<'REMOTE'
+          set -Eeuo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          PHONE_KEY="$(printf '%s' '__PB__'|base64 -d)"; MODEL="$(printf '%s' '__MB__'|base64 -d)"
+          command -v wg >/dev/null || { apt-get update -y; apt-get install -y --no-install-recommends wireguard-tools curl jq iptables; }
+          command -v curl >/dev/null || { apt-get update -y; apt-get install -y curl; }
+          command -v jq >/dev/null || { apt-get update -y; apt-get install -y jq; }
+          if ! command -v node >/dev/null 2>&1 || [ "$(node -p 'Number(process.versions.node.split(".")[0])' 2>/dev/null || echo 0)" -lt 20 ]; then curl -fsSL https://deb.nodesource.com/setup_22.x | bash -; apt-get install -y nodejs; fi
+          install -d -m 700 /etc/wireguard /etc/troc-ai /var/lib/troc-ai /srv/troc-work/queue
+          umask 077; [ -s /etc/wireguard/server.key ] || wg genkey > /etc/wireguard/server.key; wg pubkey < /etc/wireguard/server.key > /etc/wireguard/server.pub
+          WAN="$(ip route show default|awk '{print $5;exit}')"; SK="$(cat /etc/wireguard/server.key)"
+          cat >/etc/wireguard/wg0.conf <<EOF
+          [Interface]
+          Address = 10.77.0.1/24
+          ListenPort = 51820
+          PrivateKey = ${SK}
+          MTU = 1380
+          PostUp = iptables -A FORWARD -i %i -j ACCEPT; iptables -A FORWARD -o %i -j ACCEPT
+          PostDown = iptables -D FORWARD -i %i -j ACCEPT; iptables -D FORWARD -o %i -j ACCEPT
+          [Peer]
+          PublicKey = ${PHONE_KEY}
+          AllowedIPs = 10.77.0.10/32
+          EOF
+          chmod 600 /etc/wireguard/wg0.conf; systemctl enable --now wg-quick@wg0; systemctl restart wg-quick@wg0
+          ss -lun | grep -q ':51820 '
+          TMP="$(mktemp -d)"; curl -fsSL --retry 5 https://github.com/nhatkhoa-jpg/TrocAutoStudio-Releases/archive/refs/heads/work/troc-ai-mobile-v1.tar.gz | tar -xz -C "$TMP"
+          SRC="$(find "$TMP" -type d -name troc-ai|head -1)"; test -n "$SRC"; node --check "$SRC/server.mjs"; rm -rf /opt/troc-ai; cp -a "$SRC" /opt/troc-ai
+          printf '%s' '__KB__'|base64 -d >/etc/troc-ai/gemini.key; chmod 600 /etc/troc-ai/gemini.key
+          { printf 'GEMINI_API_KEY=%s\n' "$(cat /etc/troc-ai/gemini.key)"; printf 'TROC_AI_MODEL=%s\nTROC_AI_HOST=10.77.0.1\nTROC_AI_PORT=8787\nTROC_AI_STATE_DIR=/var/lib/troc-ai\nTROC_AI_QUEUE_DIR=/srv/troc-work/queue\n' "$MODEL"; } >/etc/troc-ai/env; chmod 600 /etc/troc-ai/env
+          cat >/etc/systemd/system/troc-ai.service <<'UNIT'
+          [Unit]
+          Description=Troc AI private gateway
+          After=network-online.target wg-quick@wg0.service
+          [Service]
+          Type=simple
+          User=root
+          WorkingDirectory=/opt/troc-ai
+          EnvironmentFile=/etc/troc-ai/env
+          ExecStart=/usr/bin/node /opt/troc-ai/server.mjs
+          Restart=always
+          RestartSec=3
+          [Install]
+          WantedBy=multi-user.target
+          UNIT
+          systemctl daemon-reload; systemctl enable --now troc-ai; systemctl restart troc-ai
+          for i in $(seq 1 30); do curl -fsS --max-time 4 http://10.77.0.1:8787/api/health >/tmp/h.json && break || sleep 2; done
+          jq -e '.ok==true and .gemini_ready==true' /tmp/h.json >/dev/null
+          curl -fsS --max-time 90 -H 'content-type: application/json' -d '{"message":"Reply exactly: GEMINI_OK","history":[],"mode":"chat"}' http://10.77.0.1:8787/api/chat >/tmp/c.json
+          jq -e '.answer|length>0' /tmp/c.json >/dev/null
+          echo "SERVER_WG_PUBLIC_KEY=$(cat /etc/wireguard/server.pub)"; echo TROC_AI_HEALTH_OK=1; echo GEMINI_CHAT_SMOKE_OK=1
+          REMOTE
+          sed -i "s#__PB__#$PB#g;s#__MB__#$MB#g;s#__KB__#$KB#g" /tmp/remote.sh
+          TXT="$(cat /tmp/remote.sh)"; CONTENT="$(jq -cn --arg text "$TXT" '{source:{sourceType:"TEXT",text:$text},output:{outputType:"TEXT"},commandString:"/bin/bash"}')"; TARGET="$(jq -cn --arg id "$INSTANCE_ID" '{instanceId:$id}')"
+          C="$(oci instance-agent command create --region "$REGION" --compartment-id "$TENANCY" --target "$TARGET" --content "$CONTENT" --timeout-in-seconds 900 --display-name fast-finish-deploy --query 'data.id' --raw-output)"
+          for i in $(seq 1 120); do E="$(oci instance-agent command-execution get --command-id "$C" --instance-id "$INSTANCE_ID" --region "$REGION" 2>/dev/null || true)"; S="$(jq -r '.data."lifecycle-state" // empty' <<<"$E" 2>/dev/null || true)"; echo "deploy=$i state=${S:-unknown}"; case "$S" in SUCCEEDED|FAILED|TIMED_OUT|CANCELED) break;; esac; sleep 6; done
+          test "$S" = SUCCEEDED
+          O="$(jq -r '.data.content.output // empty' <<<"$E" 2>/dev/null | base64 -d 2>/dev/null || true)"; [ -n "$O" ] || O="$(jq -r '.data.content.text // empty' <<<"$E" 2>/dev/null || true)"
+          grep -q TROC_AI_HEALTH_OK=1 <<<"$O"; grep -q GEMINI_CHAT_SMOKE_OK=1 <<<"$O"
+          WG="$(sed -n 's/^SERVER_WG_PUBLIC_KEY=//p' <<<"$O"|tail -1)"; echo "WG_SERVER_PUBLIC_KEY=$WG" >> "$GITHUB_ENV"
+
+      - name: Verify public perimeter
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          V="$(oci compute instance list-vnics --instance-id "$INSTANCE_ID" --region "$REGION" | jq -r '.data[]|select(."is-primary"==true)|.id'|head -1)"; S="$(oci network vnic get --vnic-id "$V" --region "$REGION" --query 'data."subnet-id"' --raw-output)"; SL="$(oci network subnet get --subnet-id "$S" --region "$REGION" --query 'data."security-list-ids"[0]' --raw-output)"; R="$(oci network security-list get --security-list-id "$SL" --region "$REGION")"
+          jq -e '[.data."ingress-security-rules"[]?|select(.protocol=="6")|(."tcp-options".destination."port-range".min//-1)]|(index(22)==null and index(8787)==null)' <<<"$R" >/dev/null
+          jq -e '[.data."ingress-security-rules"[]?|select(.protocol=="17")|(."udp-options".destination."port-range".min//-1)]|index(51820)!=null' <<<"$R" >/dev/null
+          echo PUBLIC_PERIMETER_OK=1
+
+      - name: Summary
+        run: |
+          echo "## DONE" >> "$GITHUB_STEP_SUMMARY"
+          echo "- IP: $PUBLIC_IP" >> "$GITHUB_STEP_SUMMARY"
+          echo "- WireGuard UDP 51820 active; server key: $WG_SERVER_PUBLIC_KEY" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Phone peer: 10.77.0.10/32" >> "$GITHUB_STEP_SUMMARY"
+          echo "- troc-ai: 10.77.0.1:8787" >> "$GITHUB_STEP_SUMMARY"
+          echo "- health + real Gemini chat passed" >> "$GITHUB_STEP_SUMMARY"
+          echo "- TCP 22/8787 non-public; UDP 51820 public" >> "$GITHUB_STEP_SUMMARY"
