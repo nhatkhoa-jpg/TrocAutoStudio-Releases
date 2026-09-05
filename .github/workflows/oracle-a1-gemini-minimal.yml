@@ -1,6 +1,9 @@
 name: Oracle A1 Gemini Minimal
 
 on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/oracle-a1-gemini-minimal.yml']
   workflow_dispatch:
 
 permissions:
