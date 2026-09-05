@@ -1,0 +1,35 @@
+name: Oracle A1 Private Stack Kick
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/oracle-a1-private-stack-kick.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: oracle-a1-private-stack-kick
+  cancel-in-progress: false
+
+jobs:
+  kick:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - name: Dispatch private stack deploy only
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          echo 'Dispatching private stack deploy only. This workflow never terminates, recreates, or resizes compute.'
+          gh workflow run oracle-a1-private-stack-deploy.yml --repo "$GITHUB_REPOSITORY" --ref main
+          sleep 5
+          RID="$(gh run list --repo "$GITHUB_REPOSITORY" --workflow oracle-a1-private-stack-deploy.yml --event workflow_dispatch --limit 1 --json databaseId --jq '.[0].databaseId')"
+          test -n "$RID"
+          echo "Private stack run: $RID"
+          gh run watch "$RID" --repo "$GITHUB_REPOSITORY" --exit-status
