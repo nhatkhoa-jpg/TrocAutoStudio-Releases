@@ -83,15 +83,23 @@ jobs:
           echo RUNCOMMAND_IAM_READY=1
           sleep 60
 
-      - name: Drain stale accepted Run Commands
+      - name: Drain stale accepted Run Commands (best effort)
         shell: bash
         run: |
           set -Eeuo pipefail
           export SUPPRESS_LABEL_WARNING=True OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING=True
-          # Do not use --all here. OCI's command-execution endpoint can return an
-          # invalid next-page token for filtered ACCEPTED results; one page is enough
-          # for this recovery queue and avoids the CLI auto-pagination failure.
-          EXECS="$(oci instance-agent command-execution list --compartment-id "$TENANCY" --instance-id "$INSTANCE_ID" --region "$REGION" --lifecycle-state ACCEPTED --limit 100)"
+          # OCI ap-singapore-2 currently returns InvalidParameter/pagination-token
+          # even for a single filtered page on command-execution list. This cleanup
+          # must never block recovery of an otherwise healthy A1.
+          set +e
+          EXECS="$(oci instance-agent command-execution list --compartment-id "$TENANCY" --instance-id "$INSTANCE_ID" --region "$REGION" --lifecycle-state ACCEPTED --limit 100 2>/tmp/runcmd-list.err)"
+          RC=$?
+          set -e
+          if [ "$RC" -ne 0 ]; then
+            echo "STALE_DRAIN_SKIPPED=OCI_EXECUTION_LIST_BROKEN"
+            sed -n '1,8p' /tmp/runcmd-list.err || true
+            exit 0
+          fi
           COUNT="$(jq '.data|length' <<<"$EXECS")"
           echo "STALE_ACCEPTED_COUNT=$COUNT"
           mapfile -t CMDS < <(jq -r '.data[] | ."instance-agent-command-id" // ."command-id" // empty' <<<"$EXECS" | sort -u)
@@ -100,9 +108,7 @@ jobs:
             echo "Canceling stale accepted command ${C:0:24}..."
             oci instance-agent command cancel --command-id "$C" --region "$REGION" --force >/dev/null 2>&1 || true
           done
-          sleep 15
-          LEFT="$(oci instance-agent command-execution list --compartment-id "$TENANCY" --instance-id "$INSTANCE_ID" --region "$REGION" --lifecycle-state ACCEPTED --limit 100 | jq '.data|length')"
-          echo "STALE_ACCEPTED_AFTER_CANCEL=$LEFT"
+          echo STALE_DRAIN_BEST_EFFORT_DONE=1
 
       - name: Re-enable plugin and soft-reset existing A1 only
         shell: bash
@@ -158,4 +164,4 @@ jobs:
 
       - name: Cleanup OCI credentials
         if: always()
-        run: rm -f "$HOME/.oci/key.pem" "$HOME/.oci/config" /tmp/enable.json
+        run: rm -f "$HOME/.oci/key.pem" "$HOME/.oci/config" /tmp/enable.json /tmp/runcmd-list.err
