@@ -1,0 +1,592 @@
+name: Oracle A1 Cloud-Init Recover
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ['work/troc-ai-mobile-v1']
+    paths:
+      - '.github/workflows/oracle-a1-cloud-init-recover.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: oracle-a1-cloud-init-recover
+  cancel-in-progress: false
+
+jobs:
+  recover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      OCI_CONFIG: ${{ secrets.OCI_CONFIG }}
+      OCI_PRIVATE_KEY: ${{ secrets.OCI_PRIVATE_KEY }}
+      OCI_SSH_PUBLIC_KEY: ${{ secrets.OCI_SSH_PUBLIC_KEY }}
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      INSTANCE_NAME: troc-cloud-codex
+      VCN_NAME: troc-codex-vcn
+      PUBLIC_SUBNET_NAME: troc-codex-public-subnet
+      SECURITY_LIST_NAME: troc-codex-public-sl
+      A1_SHAPE: VM.Standard.A1.Flex
+      A1_OCPUS: '2'
+      A1_MEMORY_GB: '12'
+      BOOT_GB: '50'
+      WG_PORT: '51820'
+      STATUS_PORT: '8788'
+      APP_PORT: '8787'
+      ENROLL_PORT: '8789'
+      PHONE_WG_PUBLIC_KEY: 'nhJ3KKQ1i2SnbXVzYP6Jopt1KBaYnEk8ykV8DAMozww='
+      APP_SOURCE_REF: work/troc-ai-mobile-v1
+      TROC_AI_MODEL: gemini-3.5-flash-lite
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Preflight
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$OCI_CONFIG"
+          test -n "$OCI_PRIVATE_KEY"
+          test -n "$OCI_SSH_PUBLIC_KEY"
+          test -n "$GEMINI_API_KEY"
+          test "$A1_SHAPE" = 'VM.Standard.A1.Flex'
+          test "$A1_OCPUS" = '2'
+          test "$A1_MEMORY_GB" = '12'
+          test "$BOOT_GB" = '50'
+          echo 'Preflight OK: A1-only 2 OCPU / 12 GB / 50 GB; no paid fallback.'
+
+      - name: Configure OCI and bootstrap keys
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq wireguard-tools >/dev/null
+          python -m pip install --disable-pip-version-check --quiet oci-cli
+          mkdir -p "$HOME/.oci"
+          printf '%s\n' "$OCI_PRIVATE_KEY" > "$HOME/.oci/oci_api_key.pem"
+          chmod 600 "$HOME/.oci/oci_api_key.pem"
+          printf '%s\n' "$OCI_CONFIG" > "$HOME/.oci/config"
+          if grep -q '^key_file=' "$HOME/.oci/config"; then
+            sed -i "s#^key_file=.*#key_file=$HOME/.oci/oci_api_key.pem#" "$HOME/.oci/config"
+          else
+            echo "key_file=$HOME/.oci/oci_api_key.pem" >> "$HOME/.oci/config"
+          fi
+          chmod 600 "$HOME/.oci/config"
+          echo 'SUPPRESS_LABEL_WARNING=True' >> "$GITHUB_ENV"
+          echo 'OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING=True' >> "$GITHUB_ENV"
+          TENANCY_ID="$(awk -F= '/^tenancy=/{gsub(/[[:space:]]/,"",$2); print $2; exit}' "$HOME/.oci/config")"
+          REGION="$(awk -F= '/^region=/{gsub(/[[:space:]]/,"",$2); print $2; exit}' "$HOME/.oci/config")"
+          test -n "$TENANCY_ID"
+          [ -n "$REGION" ] || REGION='ap-singapore-2'
+          echo "OCI_TENANCY_OCID=$TENANCY_ID" >> "$GITHUB_ENV"
+          echo "OCI_REGION=$REGION" >> "$GITHUB_ENV"
+
+          umask 077
+          wg genkey > /tmp/bootstrap-client.key
+          wg pubkey < /tmp/bootstrap-client.key > /tmp/bootstrap-client.pub
+          BOOT_CLIENT_PUB="$(cat /tmp/bootstrap-client.pub)"
+          ENROLL_TOKEN="$(openssl rand -hex 24)"
+          RUNNER_IP="$(curl -fsS --max-time 20 https://api.ipify.org)"
+          test -n "$RUNNER_IP"
+          echo "BOOT_CLIENT_PUB=$BOOT_CLIENT_PUB" >> "$GITHUB_ENV"
+          echo "ENROLL_TOKEN=$ENROLL_TOKEN" >> "$GITHUB_ENV"
+          echo "RUNNER_IP=$RUNNER_IP" >> "$GITHUB_ENV"
+          echo "GitHub validation source: $RUNNER_IP/32"
+
+      - name: Rebuild A1 with cloud-init and validate through WireGuard
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          VCN_ID="$(oci network vcn list --compartment-id "$OCI_TENANCY_OCID" --display-name "$VCN_NAME" --all | jq -r '.data[] | select(."lifecycle-state"=="AVAILABLE") | .id' | head -n1)"
+          test -n "$VCN_ID"
+          SUBNET_ID="$(oci network subnet list --compartment-id "$OCI_TENANCY_OCID" --vcn-id "$VCN_ID" --all | jq -r --arg n "$PUBLIC_SUBNET_NAME" '.data[] | select(."display-name"==$n and ."lifecycle-state"=="AVAILABLE") | .id' | head -n1)"
+          test -n "$SUBNET_ID"
+          IS_PRIVATE="$(oci network subnet get --subnet-id "$SUBNET_ID" --query 'data."prohibit-public-ip-on-vnic"' --raw-output)"
+          test "$IS_PRIVATE" = 'false'
+          SL_ID="$(oci network security-list list --compartment-id "$OCI_TENANCY_OCID" --vcn-id "$VCN_ID" --all | jq -r --arg n "$SECURITY_LIST_NAME" '.data[] | select(."display-name"==$n and ."lifecycle-state"=="AVAILABLE") | .id' | head -n1)"
+          test -n "$SL_ID"
+          echo "SECURITY_LIST_ID=$SL_ID" >> "$GITHUB_ENV"
+
+          WG_ONLY="$(jq -cn --argjson p "$WG_PORT" '[{source:"0.0.0.0/0",protocol:"17",isStateless:false,udpOptions:{destinationPortRange:{min:$p,max:$p}}}]')"
+          TEMP_INGRESS="$(jq -cn --arg src "$RUNNER_IP/32" --argjson wg "$WG_PORT" --argjson hp "$STATUS_PORT" '[{source:"0.0.0.0/0",protocol:"17",isStateless:false,udpOptions:{destinationPortRange:{min:$wg,max:$wg}}},{source:$src,protocol:"6",isStateless:false,tcpOptions:{destinationPortRange:{min:$hp,max:$hp}}}]')"
+          EGRESS='[{"destination":"0.0.0.0/0","protocol":"all","isStateless":false}]'
+          oci network security-list update --security-list-id "$SL_ID" --ingress-security-rules "$TEMP_INGRESS" --egress-security-rules "$EGRESS" --force >/dev/null
+
+          cleanup() {
+            set +e
+            sudo wg-quick down troc-bootstrap >/dev/null 2>&1 || true
+            if [ -n "${SL_ID:-}" ]; then
+              oci network security-list update --security-list-id "$SL_ID" --ingress-security-rules "$WG_ONLY" --egress-security-rules "$EGRESS" --force >/dev/null 2>&1 || true
+            fi
+            rm -f /tmp/bootstrap-client.key /tmp/bootstrap-client.pub /tmp/troc-bootstrap.conf
+          }
+          trap cleanup EXIT
+
+          AD="$(oci iam availability-domain list --compartment-id "$OCI_TENANCY_OCID" --query 'data[0].name' --raw-output)"
+          IMAGE_ID="$(oci compute image list --compartment-id "$OCI_TENANCY_OCID" --operating-system 'Canonical Ubuntu' --operating-system-version '24.04' --shape "$A1_SHAPE" --sort-by TIMECREATED --sort-order DESC --limit 1 --query 'data[0].id' --raw-output)"
+          test -n "$AD" && test "$AD" != 'null'
+          test -n "$IMAGE_ID" && test "$IMAGE_ID" != 'null'
+
+          cat >/tmp/guest-bootstrap.sh <<'GUEST'
+          #!/usr/bin/env bash
+          set -Eeuo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          exec > >(tee -a /var/log/troc-cloud-init.log) 2>&1
+          echo "TROC_BOOTSTRAP_BEGIN $(date -Is)"
+
+          BOOT_CLIENT_PUB='__BOOT_CLIENT_PUB__'
+          PHONE_PUB='__PHONE_PUB__'
+          ENROLL_TOKEN='__ENROLL_TOKEN__'
+          APP_REF='__APP_REF__'
+          APP_MODEL='__APP_MODEL__'
+
+          mkdir -p /var/lib/troc-bootstrap /etc/troc-bootstrap
+          printf '%s\n' STARTING > /var/lib/troc-bootstrap/status
+          printf '%s\n' "$BOOT_CLIENT_PUB" > /etc/troc-bootstrap/bootstrap.peer
+          printf '%s\n' "$ENROLL_TOKEN" > /etc/troc-bootstrap/enroll.token
+          chmod 600 /etc/troc-bootstrap/enroll.token
+
+          apt-get update -y
+          apt-get install -y --no-install-recommends ca-certificates curl python3 wireguard-tools iptables iproute2
+
+          cat >/etc/sysctl.d/99-troc-vpn.conf <<'SYSCTL'
+          net.ipv4.ip_forward=1
+          net.ipv4.conf.all.src_valid_mark=1
+          SYSCTL
+          sysctl --system >/dev/null
+
+          install -d -m 700 /etc/wireguard
+          umask 077
+          wg genkey > /etc/wireguard/server.key
+          wg pubkey < /etc/wireguard/server.key > /etc/wireguard/server.pub
+          SERVER_KEY="$(cat /etc/wireguard/server.key)"
+          WAN_IF="$(ip route show default | awk '{print $5; exit}')"
+          test -n "$WAN_IF"
+          cat >/etc/wireguard/wg0.conf <<EOF
+          [Interface]
+          Address = 10.77.0.1/24
+          ListenPort = 51820
+          PrivateKey = ${SERVER_KEY}
+          MTU = 1380
+          PostUp = iptables -A FORWARD -i %i -j ACCEPT; iptables -A FORWARD -o %i -j ACCEPT; iptables -t nat -A POSTROUTING -o ${WAN_IF} -j MASQUERADE
+          PostDown = iptables -D FORWARD -i %i -j ACCEPT; iptables -D FORWARD -o %i -j ACCEPT; iptables -t nat -D POSTROUTING -o ${WAN_IF} -j MASQUERADE
+
+          [Peer]
+          # bootstrap-validator
+          PublicKey = ${BOOT_CLIENT_PUB}
+          AllowedIPs = 10.77.0.2/32
+
+          [Peer]
+          # phone-owner
+          PublicKey = ${PHONE_PUB}
+          AllowedIPs = 10.77.0.10/32
+          EOF
+          chmod 600 /etc/wireguard/wg0.conf /etc/wireguard/server.key
+          systemctl enable --now wg-quick@wg0
+          cp /etc/wireguard/server.pub /var/lib/troc-bootstrap/server.pub
+          printf '%s\n' WIREGUARD_READY > /var/lib/troc-bootstrap/status
+
+          cat >/etc/systemd/system/troc-bootstrap-status.service <<'UNIT'
+          [Unit]
+          Description=Temporary Trọc bootstrap status server
+          After=network-online.target wg-quick@wg0.service
+          Wants=network-online.target
+          [Service]
+          Type=simple
+          WorkingDirectory=/var/lib/troc-bootstrap
+          ExecStart=/usr/bin/python3 -m http.server 8788 --bind 0.0.0.0 --directory /var/lib/troc-bootstrap
+          Restart=always
+          RestartSec=2
+          [Install]
+          WantedBy=multi-user.target
+          UNIT
+          systemctl daemon-reload
+          systemctl enable --now troc-bootstrap-status.service
+
+          apt-get install -y --no-install-recommends git jq unzip zip rsync tmux htop ripgrep build-essential python3-pip python3-venv openjdk-17-jdk-headless docker.io gh
+          systemctl enable --now docker
+          usermod -aG docker ubuntu || true
+          if ! command -v node >/dev/null 2>&1 || [ "$(node -p 'Number(process.versions.node.split(".")[0])' 2>/dev/null || echo 0)" -lt 22 ]; then
+            curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
+            apt-get install -y nodejs
+          fi
+          npm install -g npm@latest @google/gemini-cli @openai/codex
+
+          if ! swapon --show=NAME --noheadings | grep -q '^/swapfile$'; then
+            [ -f /swapfile ] || { fallocate -l 4G /swapfile || dd if=/dev/zero of=/swapfile bs=1M count=4096; }
+            chmod 600 /swapfile
+            mkswap /swapfile >/dev/null 2>&1 || true
+            swapon /swapfile
+          fi
+          grep -q '^/swapfile ' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
+
+          install -d -m 700 /etc/troc-ai /var/lib/troc-ai /srv/troc-work/queue /srv/troc-work/running /srv/troc-work/done /srv/troc-work/failed
+          tmp="$(mktemp -d)"
+          trap 'rm -rf "$tmp"' RETURN
+          curl -fsSL --retry 5 --retry-delay 3 "https://github.com/nhatkhoa-jpg/TrocAutoStudio-Releases/archive/refs/heads/${APP_REF}.tar.gz" | tar -xz -C "$tmp"
+          src="$(find "$tmp" -type d -name troc-ai | head -n1)"
+          test -n "$src"
+          node --check "$src/server.mjs"
+          rm -rf /opt/troc-ai
+          cp -a "$src" /opt/troc-ai
+          chown -R root:root /opt/troc-ai
+          chmod -R go-w /opt/troc-ai
+          rm -rf "$tmp"
+          trap - RETURN
+
+          cat >/etc/systemd/system/troc-ai.service <<'UNIT'
+          [Unit]
+          Description=Trọc AI private mobile gateway
+          After=network-online.target wg-quick@wg0.service
+          Wants=network-online.target wg-quick@wg0.service
+          ConditionPathExists=/etc/troc-ai/env
+          [Service]
+          Type=simple
+          User=root
+          WorkingDirectory=/opt/troc-ai
+          EnvironmentFile=/etc/troc-ai/env
+          ExecStart=/usr/bin/node /opt/troc-ai/server.mjs
+          Restart=always
+          RestartSec=3
+          NoNewPrivileges=true
+          PrivateTmp=true
+          ProtectSystem=strict
+          ReadWritePaths=/var/lib/troc-ai /srv/troc-work
+          ProtectHome=true
+          [Install]
+          WantedBy=multi-user.target
+          UNIT
+
+          cat >/usr/local/sbin/troc-ai-update <<'UPDATE'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
+          curl -fsSL --retry 3 --retry-delay 2 https://github.com/nhatkhoa-jpg/TrocAutoStudio-Releases/archive/refs/heads/main.tar.gz | tar -xz -C "$tmp"
+          src="$(find "$tmp" -type d -name troc-ai | head -n1)"
+          [ -n "$src" ] || exit 0
+          node --check "$src/server.mjs"
+          rm -rf /opt/troc-ai.new
+          cp -a "$src" /opt/troc-ai.new
+          chown -R root:root /opt/troc-ai.new
+          chmod -R go-w /opt/troc-ai.new
+          rm -rf /opt/troc-ai.prev
+          [ ! -d /opt/troc-ai ] || mv /opt/troc-ai /opt/troc-ai.prev
+          mv /opt/troc-ai.new /opt/troc-ai
+          rm -rf /opt/troc-ai.prev
+          if [ -f /etc/troc-ai/env ]; then systemctl restart troc-ai.service; fi
+          UPDATE
+          chmod 755 /usr/local/sbin/troc-ai-update
+          cat >/etc/systemd/system/troc-ai-update.service <<'UNIT'
+          [Unit]
+          Description=Update Trọc AI from main
+          After=network-online.target
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/local/sbin/troc-ai-update
+          UNIT
+          cat >/etc/systemd/system/troc-ai-update.timer <<'UNIT'
+          [Unit]
+          Description=Poll Trọc AI updates
+          [Timer]
+          OnBootSec=8min
+          OnUnitActiveSec=5min
+          RandomizedDelaySec=30s
+          Persistent=true
+          [Install]
+          WantedBy=timers.target
+          UNIT
+
+          cat >/usr/local/sbin/troc-remove-bootstrap-peer <<'REMOVE'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          PUB="$(cat /etc/troc-bootstrap/bootstrap.peer)"
+          wg set wg0 peer "$PUB" remove || true
+          python3 - "$PUB" <<'PY'
+          from pathlib import Path
+          import sys
+          p=Path('/etc/wireguard/wg0.conf')
+          pub=sys.argv[1].strip()
+          text=p.read_text()
+          blocks=text.split('\n[Peer]\n')
+          keep=[blocks[0]]
+          for block in blocks[1:]:
+              if f'PublicKey = {pub}' not in block:
+                  keep.append(block)
+          p.write_text(keep[0] + ''.join('\n[Peer]\n'+b for b in keep[1:]))
+          PY
+          systemctl disable --now troc-enroll.service 2>/dev/null || true
+          systemctl disable --now troc-bootstrap-status.service 2>/dev/null || true
+          rm -f /etc/troc-bootstrap/enroll.token
+          REMOVE
+          chmod 700 /usr/local/sbin/troc-remove-bootstrap-peer
+
+          cat >/usr/local/sbin/troc-enroll.py <<'PY'
+          import json, os, subprocess, threading
+          from http.server import BaseHTTPRequestHandler, HTTPServer
+          TOKEN=open('/etc/troc-bootstrap/enroll.token').read().strip()
+          MODEL='__APP_MODEL__'
+          class H(BaseHTTPRequestHandler):
+              def log_message(self, *args): pass
+              def do_POST(self):
+                  if self.path != '/enroll': self.send_error(404); return
+                  try:
+                      n=int(self.headers.get('content-length','0'))
+                      if n < 2 or n > 8192: raise ValueError('size')
+                      data=json.loads(self.rfile.read(n))
+                      if data.get('token') != TOKEN: self.send_error(403); return
+                      key=str(data.get('key','')).strip()
+                      if len(key) < 16 or len(key) > 4096: raise ValueError('key')
+                      os.makedirs('/etc/troc-ai', exist_ok=True)
+                      with open('/etc/troc-ai/env.tmp','w') as f:
+                          f.write('GEMINI_API_KEY='+key+'\n')
+                          f.write('TROC_AI_MODEL='+MODEL+'\n')
+                          f.write('TROC_AI_HOST=10.77.0.1\nTROC_AI_PORT=8787\n')
+                          f.write('TROC_AI_STATE_DIR=/var/lib/troc-ai\nTROC_AI_QUEUE_DIR=/srv/troc-work/queue\n')
+                      os.chmod('/etc/troc-ai/env.tmp',0o600)
+                      os.replace('/etc/troc-ai/env.tmp','/etc/troc-ai/env')
+                      subprocess.run(['systemctl','daemon-reload'],check=True)
+                      subprocess.run(['systemctl','enable','--now','troc-ai.service'],check=True)
+                      subprocess.run(['systemctl','enable','--now','troc-ai-update.timer'],check=True)
+                      open('/var/lib/troc-bootstrap/status','w').write('ENROLLED\n')
+                      subprocess.Popen(['systemd-run','--unit=troc-remove-bootstrap-peer','--on-active=180s','/usr/local/sbin/troc-remove-bootstrap-peer'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+                      body=b'{"ok":true}'
+                      self.send_response(200); self.send_header('content-type','application/json'); self.send_header('content-length',str(len(body))); self.end_headers(); self.wfile.write(body)
+                      threading.Thread(target=self.server.shutdown,daemon=True).start()
+                  except Exception:
+                      self.send_error(400)
+          HTTPServer(('10.77.0.1',8789),H).serve_forever()
+          PY
+          chmod 700 /usr/local/sbin/troc-enroll.py
+          sed -i "s#__APP_MODEL__#${APP_MODEL}#g" /usr/local/sbin/troc-enroll.py
+          cat >/etc/systemd/system/troc-enroll.service <<'UNIT'
+          [Unit]
+          Description=One-time Trọc AI secret enrollment over WireGuard
+          After=wg-quick@wg0.service
+          Requires=wg-quick@wg0.service
+          [Service]
+          Type=simple
+          ExecStart=/usr/bin/python3 /usr/local/sbin/troc-enroll.py
+          Restart=on-failure
+          RestartSec=2
+          [Install]
+          WantedBy=multi-user.target
+          UNIT
+
+          cat >/usr/local/bin/troc-health <<'HEALTH'
+          #!/usr/bin/env bash
+          set +e
+          echo '===TROC_HEALTH_BEGIN==='
+          uname -a
+          echo "CPU=$(nproc)"
+          free -h
+          df -h /
+          echo "NODE=$(node --version 2>/dev/null)"
+          echo "GEMINI=$(gemini --version 2>/dev/null)"
+          echo "CODEX=$(codex --version 2>/dev/null)"
+          echo "DOCKER=$(systemctl is-active docker 2>/dev/null)"
+          echo "WG=$(systemctl is-active wg-quick@wg0 2>/dev/null)"
+          echo "TROC_AI=$(systemctl is-active troc-ai 2>/dev/null)"
+          wg show wg0 2>/dev/null
+          echo '===TROC_HEALTH_END==='
+          HEALTH
+          chmod 755 /usr/local/bin/troc-health
+
+          systemctl daemon-reload
+          systemctl enable --now troc-enroll.service
+          printf '%s\n' READY_FOR_ENROLL > /var/lib/troc-bootstrap/status
+          echo "TROC_BOOTSTRAP_READY $(date -Is)"
+          GUEST
+
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('/tmp/guest-bootstrap.sh')
+          s=p.read_text()
+          repl={
+            '__BOOT_CLIENT_PUB__': r'''${BOOT_CLIENT_PUB}''',
+            '__PHONE_PUB__': r'''${PHONE_WG_PUBLIC_KEY}''',
+            '__ENROLL_TOKEN__': r'''${ENROLL_TOKEN}''',
+            '__APP_REF__': r'''${APP_SOURCE_REF}''',
+            '__APP_MODEL__': r'''${TROC_AI_MODEL}''',
+          }
+          for a,b in repl.items(): s=s.replace(a,b)
+          p.write_text(s)
+          PY
+          chmod 700 /tmp/guest-bootstrap.sh
+          SCRIPT_B64="$(base64 -w0 /tmp/guest-bootstrap.sh)"
+          cat >/tmp/cloud-init.yaml <<EOF
+          #cloud-config
+          package_update: false
+          write_files:
+            - path: /root/troc-bootstrap.sh
+              owner: root:root
+              permissions: '0700'
+              encoding: b64
+              content: ${SCRIPT_B64}
+          runcmd:
+            - [bash, /root/troc-bootstrap.sh]
+          EOF
+          USER_DATA_B64="$(base64 -w0 /tmp/cloud-init.yaml)"
+          META="$(jq -cn --arg key "$OCI_SSH_PUBLIC_KEY" --arg ud "$USER_DATA_B64" '{ssh_authorized_keys:$key,user_data:$ud}')"
+
+          CURRENT="$(oci compute instance list --compartment-id "$OCI_TENANCY_OCID" --display-name "$INSTANCE_NAME" --all | jq -c '[.data[] | select(."lifecycle-state" != "TERMINATED")] | sort_by(."time-created") | last')"
+          if [ "$CURRENT" != 'null' ]; then
+            OLD_ID="$(jq -r '.id' <<<"$CURRENT")"
+            OLD_SHAPE="$(jq -r '.shape' <<<"$CURRENT")"
+            OLD_CPU="$(jq -r '."shape-config".ocpus' <<<"$CURRENT")"
+            OLD_RAM="$(jq -r '."shape-config"."memory-in-gbs"' <<<"$CURRENT")"
+            test "$OLD_SHAPE" = "$A1_SHAPE"
+            awk -v v="$OLD_CPU" 'BEGIN{exit !(v<=2)}'
+            awk -v v="$OLD_RAM" 'BEGIN{exit !(v<=12)}'
+            echo "Replacing incomplete A1 $OLD_ID with cloud-init managed A1; no overlap."
+            oci compute instance terminate --instance-id "$OLD_ID" --preserve-boot-volume false --force >/dev/null
+            for i in $(seq 1 180); do
+              S="$(oci compute instance get --instance-id "$OLD_ID" --query 'data."lifecycle-state"' --raw-output 2>/dev/null || echo TERMINATED)"
+              [ "$S" = 'TERMINATED' ] && break
+              sleep 5
+            done
+            test "$S" = 'TERMINATED'
+          fi
+
+          CFG="$(jq -cn --argjson c "$A1_OCPUS" --argjson m "$A1_MEMORY_GB" '{ocpus:$c,memoryInGBs:$m}')"
+          INSTANCE_ID=''
+          for attempt in 1 2 3 4 5; do
+            echo "A1 cloud-init launch attempt $attempt"
+            set +e
+            INSTANCE_ID="$(oci compute instance launch --compartment-id "$OCI_TENANCY_OCID" --availability-domain "$AD" --display-name "$INSTANCE_NAME" --shape "$A1_SHAPE" --shape-config "$CFG" --image-id "$IMAGE_ID" --boot-volume-size-in-gbs "$BOOT_GB" --subnet-id "$SUBNET_ID" --assign-public-ip true --metadata "$META" --query 'data.id' --raw-output 2>/tmp/a1-launch.err)"
+            RC=$?
+            set -e
+            if [ "$RC" -eq 0 ] && [ -n "$INSTANCE_ID" ] && [ "$INSTANCE_ID" != 'null' ]; then break; fi
+            cat /tmp/a1-launch.err || true
+            INSTANCE_ID=''
+            sleep 20
+          done
+          if [ -z "$INSTANCE_ID" ]; then echo '::error::A1 was not reacquired. No paid fallback shape was attempted.'; exit 1; fi
+
+          for i in $(seq 1 180); do
+            STATE="$(oci compute instance get --instance-id "$INSTANCE_ID" --query 'data."lifecycle-state"' --raw-output 2>/dev/null || true)"
+            [ "$STATE" = 'RUNNING' ] && break
+            sleep 5
+          done
+          test "$STATE" = 'RUNNING'
+          VNIC_ID=''
+          for i in $(seq 1 60); do
+            VNIC_ID="$(oci compute vnic-attachment list --compartment-id "$OCI_TENANCY_OCID" --instance-id "$INSTANCE_ID" --all | jq -r '.data[0]."vnic-id" // empty' 2>/dev/null || true)"
+            [ -n "$VNIC_ID" ] && break
+            sleep 5
+          done
+          test -n "$VNIC_ID"
+          PUBLIC_IP=''
+          for i in $(seq 1 60); do
+            PUBLIC_IP="$(oci network vnic get --vnic-id "$VNIC_ID" --query 'data."public-ip"' --raw-output 2>/dev/null || true)"
+            [ -n "$PUBLIC_IP" ] && [ "$PUBLIC_IP" != 'null' ] && break
+            sleep 5
+          done
+          test -n "$PUBLIC_IP" && test "$PUBLIC_IP" != 'null'
+          echo "INSTANCE_ID=$INSTANCE_ID" >> "$GITHUB_ENV"
+          echo "OCI_PUBLIC_IP=$PUBLIC_IP" >> "$GITHUB_ENV"
+          echo "A1 running at $PUBLIC_IP. Waiting for cloud-init WireGuard bootstrap..."
+
+          SERVER_PUB=''
+          for i in $(seq 1 240); do
+            SERVER_PUB="$(curl -fsS --max-time 3 "http://${PUBLIC_IP}:${STATUS_PORT}/server.pub" 2>/dev/null | tr -d '\r\n' || true)"
+            if [ -n "$SERVER_PUB" ]; then break; fi
+            sleep 5
+          done
+          test -n "$SERVER_PUB"
+          echo "WG_SERVER_PUBLIC_KEY=$SERVER_PUB" >> "$GITHUB_ENV"
+          echo 'Cloud-init WireGuard endpoint discovered.'
+
+          cat >/tmp/troc-bootstrap.conf <<EOF
+          [Interface]
+          PrivateKey = $(cat /tmp/bootstrap-client.key)
+          Address = 10.77.0.2/32
+          MTU = 1380
+
+          [Peer]
+          PublicKey = ${SERVER_PUB}
+          Endpoint = ${PUBLIC_IP}:${WG_PORT}
+          AllowedIPs = 10.77.0.0/24
+          PersistentKeepalive = 25
+          EOF
+          chmod 600 /tmp/troc-bootstrap.conf
+          sudo cp /tmp/troc-bootstrap.conf /etc/wireguard/troc-bootstrap.conf
+          sudo chmod 600 /etc/wireguard/troc-bootstrap.conf
+          sudo wg-quick up troc-bootstrap
+
+          READY=''
+          for i in $(seq 1 240); do
+            READY="$(curl -fsS --max-time 3 http://10.77.0.1:${STATUS_PORT}/status 2>/dev/null | tr -d '\r\n' || true)"
+            echo "Guest bootstrap status: ${READY:-waiting}"
+            [ "$READY" = 'READY_FOR_ENROLL' ] && break
+            sleep 5
+          done
+          test "$READY" = 'READY_FOR_ENROLL'
+
+          PAYLOAD="$(jq -cn --arg token "$ENROLL_TOKEN" --arg key "$GEMINI_API_KEY" '{token:$token,key:$key}')"
+          ENROLL_RESP="$(curl -fsS --max-time 20 -H 'content-type: application/json' -d "$PAYLOAD" http://10.77.0.1:${ENROLL_PORT}/enroll)"
+          jq -e '.ok==true' <<<"$ENROLL_RESP" >/dev/null
+          unset PAYLOAD ENROLL_RESP
+
+          HEALTH=''
+          for i in $(seq 1 60); do
+            HEALTH="$(curl -fsS --max-time 4 http://10.77.0.1:${APP_PORT}/api/health 2>/dev/null || true)"
+            if jq -e '.ok==true and .gemini_ready==true' <<<"$HEALTH" >/dev/null 2>&1; then break; fi
+            sleep 3
+          done
+          jq -e '.ok==true and .gemini_ready==true' <<<"$HEALTH" >/dev/null
+          echo "$HEALTH" | jq '{ok,service,model,gemini_ready,active_requests,queued_requests}'
+
+          set +e
+          CHAT_HTTP="$(curl -sS --max-time 120 -o /tmp/chat-smoke.json -w '%{http_code}' -H 'content-type: application/json' -d '{"message":"Chỉ trả lời đúng một từ: OK","history":[],"mode":"chat"}' http://10.77.0.1:${APP_PORT}/api/chat)"
+          CHAT_RC=$?
+          set -e
+          test "$CHAT_RC" -eq 0
+          if [ "$CHAT_HTTP" = '200' ]; then
+            jq -e '.answer|length>0' /tmp/chat-smoke.json >/dev/null
+            echo "Trọc AI live Gemini chat smoke: PASS"
+          elif [ "$CHAT_HTTP" = '429' ]; then
+            jq -e '.error=="gemini_cooldown" or (.error|startswith("gemini_http_429"))' /tmp/chat-smoke.json >/dev/null
+            echo 'Trọc AI gateway works; Gemini Free returned a quota cooldown during smoke test.'
+          else
+            cat /tmp/chat-smoke.json || true
+            echo "::error::Unexpected Trọc AI chat HTTP $CHAT_HTTP"
+            exit 1
+          fi
+
+          echo 'A1 cloud-init recovery and private Trọc AI validation succeeded.'
+
+      - name: Final network safety check
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          if [ -n "${SECURITY_LIST_ID:-}" ]; then
+            WG_ONLY="$(jq -cn --argjson p "$WG_PORT" '[{source:"0.0.0.0/0",protocol:"17",isStateless:false,udpOptions:{destinationPortRange:{min:$p,max:$p}}}]')"
+            EGRESS='[{"destination":"0.0.0.0/0","protocol":"all","isStateless":false}]'
+            oci network security-list update --security-list-id "$SECURITY_LIST_ID" --ingress-security-rules "$WG_ONLY" --egress-security-rules "$EGRESS" --force >/dev/null
+            echo 'OCI ingress restored to WireGuard UDP/51820 only.'
+          fi
+
+      - name: Summary
+        if: success()
+        shell: bash
+        run: |
+          {
+            echo '## Oracle A1 + Trọc AI READY'
+            echo ''
+            echo "- Region: \`$OCI_REGION\`"
+            echo '- Shape: `VM.Standard.A1.Flex — 2 OCPU / 12 GB / 50 GB`'
+            echo "- Public IPv4: \`$OCI_PUBLIC_IP\`"
+            echo '- Public ingress: `UDP/51820 only`'
+            echo '- WireGuard: `10.77.0.1/24`, MTU `1380`'
+            echo "- WireGuard server public key: \`$WG_SERVER_PUBLIC_KEY\`"
+            echo '- Phone peer reserved: `10.77.0.10/32`'
+            echo '- Trọc AI: `http://10.77.0.1:8787` through WireGuard only'
+            echo "- Model: \`$TROC_AI_MODEL\` (Free key; no paid fallback)"
+            echo '- Docker, Node 22, Gemini CLI, Codex CLI, gh, Python, Java 17, 4 GB swap installed by cloud-init'
+            echo '- `troc-ai.service`: restart always, 24/7'
+            echo '- `troc-ai-update.timer`: polls `main` every ~5 minutes for safe app updates'
+            echo '- Real health + chat smoke validated through an ephemeral WireGuard peer'
+          } >> "$GITHUB_STEP_SUMMARY"

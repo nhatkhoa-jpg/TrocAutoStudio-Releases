@@ -1,0 +1,62 @@
+name: Oracle A1 Run Command Probe V2
+
+on:
+  push:
+    branches: ['work/troc-ai-mobile-v1']
+    paths:
+      - '.github/workflows/oracle-a1-run-command-probe-v2.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    env:
+      OCI_CONFIG: ${{ secrets.OCI_CONFIG }}
+      OCI_PRIVATE_KEY: ${{ secrets.OCI_PRIVATE_KEY }}
+      INSTANCE_NAME: troc-cloud-codex
+    steps:
+      - name: Configure OCI
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check --quiet oci-cli
+          mkdir -p "$HOME/.oci"
+          printf '%s\n' "$OCI_PRIVATE_KEY" > "$HOME/.oci/key.pem"
+          chmod 600 "$HOME/.oci/key.pem"
+          printf '%s\n' "$OCI_CONFIG" > "$HOME/.oci/config"
+          if grep -q '^key_file=' "$HOME/.oci/config"; then sed -i "s#^key_file=.*#key_file=$HOME/.oci/key.pem#" "$HOME/.oci/config"; else echo "key_file=$HOME/.oci/key.pem" >> "$HOME/.oci/config"; fi
+          chmod 600 "$HOME/.oci/config"
+          export SUPPRESS_LABEL_WARNING=True OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING=True
+          T="$(awk -F= '/^tenancy=/{gsub(/[[:space:]]/,"",$2);print $2;exit}' "$HOME/.oci/config")"
+          test -n "$T"
+          echo "TENANCY_ID=$T" >> "$GITHUB_ENV"
+
+      - name: Probe current A1
+        shell: bash
+        run: |
+          set -euo pipefail
+          ID="$(oci compute instance list --compartment-id "$TENANCY_ID" --display-name "$INSTANCE_NAME" --all | jq -r '[.data[]|select(."lifecycle-state"=="RUNNING" and .shape=="VM.Standard.A1.Flex" and ."shape-config".ocpus<=2 and ."shape-config"."memory-in-gbs"<=12)]|sort_by(."time-created")|last|.id//empty')"
+          test -n "$ID"
+          echo "INSTANCE_ID=$ID" >> "$GITHUB_ENV"
+          oci instance-agent plugin list --compartment-id "$TENANCY_ID" --instanceagent-id "$ID" --all | jq -r '.data[] | [.name,.status] | @tsv'
+          SCRIPT='echo TROC_RUN_COMMAND_OK; date -Is; cat /var/lib/troc-bootstrap/status 2>/dev/null || true; systemctl is-active wg-quick@wg0 2>/dev/null || true; systemctl is-active docker 2>/dev/null || true; systemctl is-active troc-ai 2>/dev/null || true; [ ! -f /etc/wireguard/server.pub ] || sed "s/^/WG_PUBLIC_KEY=/" /etc/wireguard/server.pub'
+          CONTENT="$(jq -cn --arg text "$SCRIPT" '{source:{sourceType:"TEXT",text:$text},output:{outputType:"TEXT"},commandString:"/bin/bash"}')"
+          TARGET="$(jq -cn --arg id "$ID" '{instanceId:$id}')"
+          CMD="$(oci instance-agent command create --compartment-id "$TENANCY_ID" --content "$CONTENT" --target "$TARGET" --timeout-in-seconds 120 --display-name 'a1-probe-v2' --query 'data.id' --raw-output)"
+          test -n "$CMD" && test "$CMD" != null
+          FINAL=''; EXEC=''
+          for i in $(seq 1 36); do
+            EXEC="$(oci instance-agent command-execution get --command-id "$CMD" --instance-id "$ID" 2>/dev/null || true)"
+            FINAL="$(jq -r '.data."lifecycle-state" // empty' <<<"$EXEC" 2>/dev/null || true)"
+            case "$FINAL" in SUCCEEDED|FAILED|TIMED_OUT|CANCELED) break;; esac
+            sleep 5
+          done
+          OUTPUT="$(jq -r '.data.content.text // .data.content.message // empty' <<<"$EXEC" 2>/dev/null || true)"
+          printf '%s\n' "$OUTPUT"
+          echo "FINAL=$FINAL"
+          test "$FINAL" = SUCCEEDED
+          grep -q TROC_RUN_COMMAND_OK <<<"$OUTPUT"

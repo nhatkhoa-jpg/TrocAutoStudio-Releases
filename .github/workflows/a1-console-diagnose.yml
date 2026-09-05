@@ -1,0 +1,42 @@
+name: A1 Console Diagnose
+
+on:
+  push:
+    branches: ['work/troc-ai-mobile-v1']
+    paths: ['.github/workflows/a1-console-diagnose.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    env:
+      OCI_CONFIG: ${{ secrets.OCI_CONFIG }}
+      OCI_PRIVATE_KEY: ${{ secrets.OCI_PRIVATE_KEY }}
+      INSTANCE_NAME: troc-cloud-codex
+    steps:
+      - name: Capture sanitized serial console
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python -m pip install --disable-pip-version-check --quiet oci-cli
+          mkdir -p "$HOME/.oci"
+          printf '%s\n' "$OCI_PRIVATE_KEY" > "$HOME/.oci/key.pem"
+          chmod 600 "$HOME/.oci/key.pem"
+          printf '%s\n' "$OCI_CONFIG" > "$HOME/.oci/config"
+          if grep -q '^key_file=' "$HOME/.oci/config"; then sed -i "s#^key_file=.*#key_file=$HOME/.oci/key.pem#" "$HOME/.oci/config"; else echo "key_file=$HOME/.oci/key.pem" >> "$HOME/.oci/config"; fi
+          chmod 600 "$HOME/.oci/config"
+          export SUPPRESS_LABEL_WARNING=True OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING=True
+          T="$(awk -F= '/^tenancy=/{gsub(/[[:space:]]/,"",$2);print $2;exit}' "$HOME/.oci/config")"
+          ID="$(oci compute instance list --compartment-id "$T" --display-name "$INSTANCE_NAME" --all | jq -r '[.data[]|select(."lifecycle-state"=="RUNNING" and .shape=="VM.Standard.A1.Flex" and ."shape-config".ocpus<=2 and ."shape-config"."memory-in-gbs"<=12)]|sort_by(."time-created")|last|.id//empty')"
+          test -n "$ID"
+          H="$(oci compute console-history capture --instance-id "$ID" --wait-for-state SUCCEEDED --wait-for-state FAILED --wait-interval-seconds 5 --query 'data.id' --raw-output)"
+          test -n "$H" && test "$H" != null
+          oci compute console-history get-content --instance-console-history-id "$H" --file /tmp/console.log
+          echo '=== sanitized cloud-init/boot diagnosis ==='
+          grep -Eai 'cloud-init|cloud-final|scripts-user|TROC_|wireguard|wg-quick|apt|error|fail|traceback|user-data|runcmd' /tmp/console.log | tail -n 250 | sed -E 's/(GEMINI_API_KEY|ENROLL_TOKEN|token|key)=([^[:space:]]+)/\1=[REDACTED]/Ig' || true
+          echo '=== end diagnosis ==='
+          oci compute console-history delete --instance-console-history-id "$H" --force >/dev/null || true
