@@ -35,6 +35,7 @@ jobs:
           printf '%s\n' "$OCI_CONFIG" > "$HOME/.oci/config"
           if grep -q '^key_file=' "$HOME/.oci/config"; then sed -i "s#^key_file=.*#key_file=$HOME/.oci/key.pem#" "$HOME/.oci/config"; else echo "key_file=$HOME/.oci/key.pem" >> "$HOME/.oci/config"; fi
           chmod 600 "$HOME/.oci/config"
+          export SUPPRESS_LABEL_WARNING=True OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING=True
           T="$(awk -F= '/^tenancy=/{gsub(/[[:space:]]/,"",$2);print $2;exit}' "$HOME/.oci/config")"
           R="$(awk -F= '/^region=/{gsub(/[[:space:]]/,"",$2);print $2;exit}' "$HOME/.oci/config")"
           test -n "$T" && test "$R" = "$REGION"
@@ -48,42 +49,52 @@ jobs:
           echo "TENANCY=$T" >> "$GITHUB_ENV"; echo "INSTANCE_ID=$ID" >> "$GITHUB_ENV"; echo "PUBLIC_IP=$PUB" >> "$GITHUB_ENV"
           echo "SAFE_A1_OK shape=$SH cpu=$CPU ram=$RAM boot=$SIZE ip=$PUB"
 
-      - name: Hard-reset only Run Command plugin
+      - name: Drain stale accepted Run Commands
         shell: bash
         run: |
           set -Eeuo pipefail
-          cat >/tmp/disable.json <<'JSON'
-          {"isManagementDisabled":false,"areAllPluginsDisabled":false,"pluginsConfig":[{"name":"Compute Instance Run Command","desiredState":"DISABLED"}]}
-          JSON
+          export SUPPRESS_LABEL_WARNING=True OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING=True
+          EXECS="$(oci instance-agent command-execution list --compartment-id "$TENANCY" --instance-id "$INSTANCE_ID" --region "$REGION" --lifecycle-state ACCEPTED --all)"
+          COUNT="$(jq '.data|length' <<<"$EXECS")"
+          echo "STALE_ACCEPTED_COUNT=$COUNT"
+          mapfile -t CMDS < <(jq -r '.data[] | ."instance-agent-command-id" // ."command-id" // empty' <<<"$EXECS" | sort -u)
+          for C in "${CMDS[@]}"; do
+            [ -n "$C" ] || continue
+            echo "Canceling stale accepted command ${C:0:24}..."
+            oci instance-agent command cancel --command-id "$C" --region "$REGION" --force >/dev/null 2>&1 || true
+          done
+          sleep 20
+          LEFT="$(oci instance-agent command-execution list --compartment-id "$TENANCY" --instance-id "$INSTANCE_ID" --region "$REGION" --lifecycle-state ACCEPTED --all | jq '.data|length')"
+          echo "STALE_ACCEPTED_AFTER_CANCEL=$LEFT"
+
+      - name: Re-enable plugin and soft-reset existing A1 only
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          export SUPPRESS_LABEL_WARNING=True OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING=True
           cat >/tmp/enable.json <<'JSON'
           {"isManagementDisabled":false,"areAllPluginsDisabled":false,"pluginsConfig":[{"name":"Compute Instance Run Command","desiredState":"ENABLED"}]}
           JSON
-          oci compute instance update --instance-id "$INSTANCE_ID" --region "$REGION" --agent-config file:///tmp/disable.json --force >/dev/null
-          echo 'Requested Run Command DISABLED'
+          oci compute instance update --instance-id "$INSTANCE_ID" --region "$REGION" --agent-config file:///tmp/enable.json --force >/dev/null
+          echo 'Run Command desiredState=ENABLED'
+          oci compute instance action --instance-id "$INSTANCE_ID" --region "$REGION" --action SOFTRESET --wait-for-state RUNNING --wait-interval-seconds 5 >/dev/null
+          echo 'SAFE_SOFTRESET_DONE=1'
+          sleep 45
+          ST=''
           for i in $(seq 1 36); do
             ST="$(oci instance-agent plugin list --compartment-id "$TENANCY" --instanceagent-id "$INSTANCE_ID" --region "$REGION" --all 2>/dev/null | jq -r '.data[]|select(.name=="Compute Instance Run Command")|.status' | head -1)"
-            echo "disable_check=$i status=${ST:-missing}"
-            [ "${ST:-}" != RUNNING ] && break
-            sleep 10
-          done
-          sleep 20
-          oci compute instance update --instance-id "$INSTANCE_ID" --region "$REGION" --agent-config file:///tmp/enable.json --force >/dev/null
-          echo 'Requested Run Command ENABLED'
-          ST=''
-          for i in $(seq 1 48); do
-            ST="$(oci instance-agent plugin list --compartment-id "$TENANCY" --instanceagent-id "$INSTANCE_ID" --region "$REGION" --all 2>/dev/null | jq -r '.data[]|select(.name=="Compute Instance Run Command")|.status' | head -1)"
-            echo "enable_check=$i status=${ST:-missing}"
+            echo "plugin_check=$i status=${ST:-missing}"
             [ "$ST" = RUNNING ] && break
             sleep 10
           done
           test "$ST" = RUNNING
-          sleep 20
+          sleep 15
 
       - name: Prove Run Command is consumed
         shell: bash
         run: |
           set -Eeuo pipefail
-          C="$(oci instance-agent command create --region "$REGION" --compartment-id "$TENANCY" --target '{"instanceId":"'"$INSTANCE_ID"'"}' --content '{"source":{"sourceType":"TEXT","text":"set -eu; echo GUEST_OK; uname -m"},"output":{"outputType":"TEXT"},"commandString":"/bin/bash"}' --timeout-in-seconds 180 --display-name runcommand-reset-probe --query 'data.id' --raw-output)"
+          C="$(oci instance-agent command create --region "$REGION" --compartment-id "$TENANCY" --target '{"instanceId":"'"$INSTANCE_ID"'"}' --content '{"source":{"sourceType":"TEXT","text":"set -eu; echo GUEST_OK; uname -m"},"output":{"outputType":"TEXT"},"commandString":"/bin/bash"}' --timeout-in-seconds 180 --display-name runcommand-queue-drain-probe --query 'data.id' --raw-output)"
           E=''; S=''
           for i in $(seq 1 48); do
             E="$(oci instance-agent command-execution get --command-id "$C" --instance-id "$INSTANCE_ID" --region "$REGION" 2>/dev/null || true)"
@@ -92,10 +103,10 @@ jobs:
             case "$S" in SUCCEEDED|FAILED|TIMED_OUT|CANCELED) break;; esac
             sleep 5
           done
-          test "$S" = SUCCEEDED
           O="$(jq -r '.data.content.output // empty' <<<"$E" 2>/dev/null | base64 -d 2>/dev/null || true)"
           [ -n "$O" ] || O="$(jq -r '.data.content.text // empty' <<<"$E" 2>/dev/null || true)"
           printf '%s\n' "$O"
+          test "$S" = SUCCEEDED
           grep -q GUEST_OK <<<"$O"
           echo RUNCOMMAND_CONSUMED_OK=1
 
@@ -110,4 +121,4 @@ jobs:
 
       - name: Cleanup OCI credentials
         if: always()
-        run: rm -f "$HOME/.oci/key.pem" "$HOME/.oci/config" /tmp/disable.json /tmp/enable.json
+        run: rm -f "$HOME/.oci/key.pem" "$HOME/.oci/config" /tmp/enable.json
