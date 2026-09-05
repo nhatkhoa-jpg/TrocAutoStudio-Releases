@@ -53,7 +53,7 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
-          KEY_B64="$(printf '%s' "$GEMINI_API_KEY" | base64 -w0)"
+          export KEY_B64="$(printf '%s' "$GEMINI_API_KEY" | base64 -w0)"
           python3 - <<'PY'
           import json, os
           keyb64=os.environ['KEY_B64']
@@ -144,8 +144,6 @@ jobs:
           grep -q 'TROC_AI_HEALTH_OK=1' <<<"$O"
           grep -q 'TROC_AI_CHAT_OK=1' <<<"$O"
           grep -q 'TROC_AI_SERVICE_OK=1' <<<"$O"
-        env:
-          KEY_B64: ${{ env.KEY_B64 }}
 
       - name: Cleanup
         if: always()
