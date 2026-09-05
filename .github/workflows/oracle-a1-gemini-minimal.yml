@@ -54,7 +54,23 @@ jobs:
           python3 - <<'PY2'
           import json, urllib.request
           KEY = __KEY__
-          url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=" + KEY
+          base = "https://generativelanguage.googleapis.com/v1beta"
+          with urllib.request.urlopen(base + "/models?key=" + KEY, timeout=30) as r:
+              models = json.load(r).get("models", [])
+          usable=[]
+          for m in models:
+              methods=m.get("supportedGenerationMethods", [])
+              name=m.get("name", "")
+              if "generateContent" in methods and name.startswith("models/"):
+                  usable.append(name.split("/",1)[1])
+          preferred=["gemini-3.8-flash","gemini-3.5-flash-lite","gemini-3.1-flash-lite","gemini-2.5-flash-lite"]
+          model=next((x for x in preferred if x in usable), None)
+          if not model:
+              model=next((x for x in usable if "flash" in x.lower()), None)
+          if not model:
+              raise SystemExit("NO_GENERATECONTENT_MODEL_AVAILABLE")
+          print("GEMINI_MODEL=" + model)
+          url = base + "/models/" + model + ":generateContent?key=" + KEY
           payload = json.dumps({"contents":[{"parts":[{"text":"Reply exactly: GEMINI_OK"}]}]}).encode()
           req = urllib.request.Request(url, data=payload, headers={"Content-Type":"application/json"})
           with urllib.request.urlopen(req, timeout=30) as r:
