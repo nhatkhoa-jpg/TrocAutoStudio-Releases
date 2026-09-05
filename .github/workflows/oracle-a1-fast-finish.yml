@@ -37,17 +37,29 @@ jobs:
           printf '%s\n' "$OCI_CONFIG" > "$HOME/.oci/config"
           if grep -q '^key_file=' "$HOME/.oci/config"; then sed -i "s#^key_file=.*#key_file=$HOME/.oci/key.pem#" "$HOME/.oci/config"; else echo "key_file=$HOME/.oci/key.pem" >> "$HOME/.oci/config"; fi
           chmod 600 "$HOME/.oci/config"
+          export SUPPRESS_LABEL_WARNING=True OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING=True
           T="$(awk -F= '/^tenancy=/{gsub(/[[:space:]]/,"",$2);print $2;exit}' "$HOME/.oci/config")"
           R="$(awk -F= '/^region=/{gsub(/[[:space:]]/,"",$2);print $2;exit}' "$HOME/.oci/config")"
           test -n "$T" && test "$R" = "$REGION"
-          J="$(oci compute instance list --compartment-id "$T" --region "$R" --display-name "$INSTANCE_NAME" --all | jq -c '[.data[]|select(."lifecycle-state"=="RUNNING")]|sort_by(."time-created")|last')"
+          J="$(oci compute instance list --compartment-id "$T" --region "$R" --display-name "$INSTANCE_NAME" --all | jq -c '[.data[]|select(."lifecycle-state"!="TERMINATED")]|sort_by(."time-created")|last')"
           test "$J" != null
-          ID="$(jq -r '.id' <<<"$J")"; SH="$(jq -r '.shape' <<<"$J")"; CPU="$(jq -r '."shape-config".ocpus' <<<"$J")"; RAM="$(jq -r '."shape-config"."memory-in-gbs"' <<<"$J")"
-          test "$SH" = VM.Standard.A1.Flex; test "$CPU" = 2; test "$RAM" = 12
+          ID="$(jq -r '.id' <<<"$J")"; STATE="$(jq -r '."lifecycle-state"' <<<"$J")"; SH="$(jq -r '.shape' <<<"$J")"; CPU="$(jq -r '."shape-config".ocpus' <<<"$J")"; RAM="$(jq -r '."shape-config"."memory-in-gbs"' <<<"$J")"
+          echo "Candidate A1: state=$STATE shape=$SH cpu=$CPU ram=$RAM"
+          test "$SH" = VM.Standard.A1.Flex
+          awk -v v="$CPU" 'BEGIN{exit !(v==2)}'
+          awk -v v="$RAM" 'BEGIN{exit !(v==12)}'
+          if [ "$STATE" != RUNNING ]; then
+            echo "Existing exact A1 is $STATE; waiting for RUNNING without recreate/terminate."
+            oci compute instance get --instance-id "$ID" --region "$R" --wait-for-state RUNNING --max-wait-seconds 300 >/dev/null
+          fi
           AD="$(jq -r '."availability-domain"' <<<"$J")"
-          BV="$(oci compute boot-volume-attachment list --availability-domain "$AD" --compartment-id "$T" --instance-id "$ID" --region "$R" --all | jq -r '.data[0]."boot-volume-id"')"
-          SIZE="$(oci bv boot-volume get --boot-volume-id "$BV" --region "$R" --query 'data."size-in-gbs"' --raw-output)"; test "$SIZE" = 50
+          BV="$(oci compute boot-volume-attachment list --availability-domain "$AD" --compartment-id "$T" --instance-id "$ID" --region "$R" --all | jq -r '[.data[]|select(."lifecycle-state"!="DETACHED")][0]."boot-volume-id" // empty')"
+          test -n "$BV"
+          SIZE="$(oci bv boot-volume get --boot-volume-id "$BV" --region "$R" --query 'data."size-in-gbs"' --raw-output)"
+          echo "Boot volume size=$SIZE GB"
+          awk -v v="$SIZE" 'BEGIN{exit !(v==50)}'
           PUB="$(oci compute instance list-vnics --instance-id "$ID" --region "$R" | jq -r '.data[]|select(."is-primary"==true)|."public-ip"' | head -1)"
+          test -n "$PUB" && test "$PUB" != null
           echo "TENANCY=$T" >> "$GITHUB_ENV"; echo "INSTANCE_ID=$ID" >> "$GITHUB_ENV"; echo "PUBLIC_IP=$PUB" >> "$GITHUB_ENV"
           echo "Validated existing A1 only: 2 OCPU / 12 GB / 50 GB, IP=$PUB"
 
