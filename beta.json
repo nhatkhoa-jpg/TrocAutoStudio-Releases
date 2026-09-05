@@ -2,7 +2,7 @@
   "versionCode": 849,
   "versionName": "0.7.4-beta40",
   "channel": "beta",
-  "sha256": "8d2cb46909f3f7ee2d6035bb6fba96144334e2707c80471b3cef3bfec03782c5",
+  "sha256": "dabb24b62d4528c4d165cf7fb7f9385f3d7013bf45a8d90d06dc12c15030fa0e",
   "sizeBytes": 126052704,
   "signingGeneration": 2,
   "releaseNotes": "Beta signing v2. Có thể cập nhật trực tiếp trong app; không cần gỡ phiên bản signing v2 đang dùng.",
