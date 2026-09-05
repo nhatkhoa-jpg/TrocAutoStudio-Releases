@@ -164,10 +164,13 @@ jobs:
               --ingress-security-rules "$INGRESS" --egress-security-rules "$EGRESS" --force >/dev/null
           fi
 
+          # Preserve the existing subnet's public/private attribute. OCI CLI does not
+          # support --prohibit-public-ip-on-vnic on subnet update, and this healthy A1
+          # must never be recreated just to change subnet classification.
           SL_IDS="$(jq -cn --arg id "$SL_ID" '[$id]')"
           oci network subnet update --subnet-id "$SUBNET_ID" \
             --route-table-id "$RT_ID" --security-list-ids "$SL_IDS" \
-            --prohibit-public-ip-on-vnic false --force >/dev/null
+            --force >/dev/null
 
           PUBLIC_IP="$(oci network vnic get --vnic-id "$VNIC_ID" --query 'data."public-ip"' --raw-output)"
           if [ -z "$PUBLIC_IP" ] || [ "$PUBLIC_IP" = "null" ]; then
