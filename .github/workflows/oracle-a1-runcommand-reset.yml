@@ -88,9 +88,6 @@ jobs:
         run: |
           set -Eeuo pipefail
           export SUPPRESS_LABEL_WARNING=True OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING=True
-          # OCI ap-singapore-2 currently returns InvalidParameter/pagination-token
-          # even for a single filtered page on command-execution list. This cleanup
-          # must never block recovery of an otherwise healthy A1.
           set +e
           EXECS="$(oci instance-agent command-execution list --compartment-id "$TENANCY" --instance-id "$INSTANCE_ID" --region "$REGION" --lifecycle-state ACCEPTED --limit 100 2>/tmp/runcmd-list.err)"
           RC=$?
@@ -100,12 +97,9 @@ jobs:
             sed -n '1,8p' /tmp/runcmd-list.err || true
             exit 0
           fi
-          COUNT="$(jq '.data|length' <<<"$EXECS")"
-          echo "STALE_ACCEPTED_COUNT=$COUNT"
           mapfile -t CMDS < <(jq -r '.data[] | ."instance-agent-command-id" // ."command-id" // empty' <<<"$EXECS" | sort -u)
           for C in "${CMDS[@]}"; do
             [ -n "$C" ] || continue
-            echo "Canceling stale accepted command ${C:0:24}..."
             oci instance-agent command cancel --command-id "$C" --region "$REGION" --force >/dev/null 2>&1 || true
           done
           echo STALE_DRAIN_BEST_EFFORT_DONE=1
@@ -119,7 +113,6 @@ jobs:
           {"isManagementDisabled":false,"areAllPluginsDisabled":false,"pluginsConfig":[{"name":"Compute Instance Run Command","desiredState":"ENABLED"}]}
           JSON
           oci compute instance update --instance-id "$INSTANCE_ID" --region "$REGION" --agent-config file:///tmp/enable.json --force >/dev/null
-          echo 'Run Command desiredState=ENABLED'
           oci compute instance action --instance-id "$INSTANCE_ID" --region "$REGION" --action SOFTRESET --wait-for-state RUNNING --wait-interval-seconds 5 >/dev/null
           echo 'SAFE_SOFTRESET_DONE=1'
           sleep 45
@@ -137,7 +130,10 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
-          C="$(oci instance-agent command create --region "$REGION" --compartment-id "$TENANCY" --target '{"instanceId":"'"$INSTANCE_ID"'"}' --content '{"source":{"sourceType":"TEXT","text":"set -eu; echo GUEST_OK; uname -m"},"output":{"outputType":"TEXT"},"commandString":"/bin/bash"}' --timeout-in-seconds 180 --display-name runcommand-iam-probe --query 'data.id' --raw-output)"
+          # Oracle documents that Linux Run Command executes TEXT source in bash.
+          # Do not set commandString=/bin/bash: the plugin treats it as a path inside
+          # its per-command working directory, which caused .../wd/<id>/bin/bash ENOENT.
+          C="$(oci instance-agent command create --region "$REGION" --compartment-id "$TENANCY" --target '{"instanceId":"'"$INSTANCE_ID"'"}' --content '{"source":{"sourceType":"TEXT","text":"set -eu; echo GUEST_OK; uname -m"},"output":{"outputType":"TEXT"}}' --timeout-in-seconds 180 --display-name runcommand-native-bash-probe --query 'data.id' --raw-output)"
           E=''; S=''
           for i in $(seq 1 72); do
             E="$(oci instance-agent command-execution get --command-id "$C" --instance-id "$INSTANCE_ID" --region "$REGION" 2>/dev/null || true)"
@@ -153,14 +149,14 @@ jobs:
           grep -q GUEST_OK <<<"$O"
           echo RUNCOMMAND_CONSUMED_OK=1
 
-      - name: Dispatch private stack deploy
+      - name: Dispatch minimal Gemini test
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -Eeuo pipefail
-          gh workflow run oracle-a1-private-stack-deploy.yml --repo "$GITHUB_REPOSITORY" --ref main
-          echo PRIVATE_STACK_DISPATCHED=1
+          gh workflow run oracle-a1-gemini-minimal.yml --repo "$GITHUB_REPOSITORY" --ref main
+          echo GEMINI_MINIMAL_DISPATCHED=1
 
       - name: Cleanup OCI credentials
         if: always()
