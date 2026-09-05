@@ -5,8 +5,6 @@ on:
     branches: [main]
     paths:
       - '.github/workflows/oracle-a1-rebuild-auto-v2.yml'
-  schedule:
-    - cron: '*/5 * * * *'
   workflow_dispatch:
 
 permissions:
@@ -138,7 +136,7 @@ jobs:
           if [ "$RC" -ne 0 ]; then
             if grep -Eqi 'capacity|out of host capacity|limit|quota' <<<"$OUT"; then
               echo 'capacity_wait=true' >> "$GITHUB_OUTPUT"
-              echo 'No A1 capacity right now; old boot volume remains preserved. Scheduled retry in 5 minutes.'
+              echo 'No A1 capacity right now; old boot volume remains preserved.'
               exit 0
             fi
             printf '%s\n' "$OUT"
