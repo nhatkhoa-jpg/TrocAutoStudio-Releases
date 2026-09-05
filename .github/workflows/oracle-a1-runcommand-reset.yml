@@ -17,12 +17,14 @@ concurrency:
 jobs:
   reset:
     runs-on: ubuntu-latest
-    timeout-minutes: 18
+    timeout-minutes: 25
     env:
       OCI_CONFIG: ${{ secrets.OCI_CONFIG }}
       OCI_PRIVATE_KEY: ${{ secrets.OCI_PRIVATE_KEY }}
       REGION: ap-singapore-2
       INSTANCE_NAME: troc-cloud-codex
+      RUNCOMMAND_DG_NAME: troc-cloud-codex-runcmd
+      RUNCOMMAND_POLICY_NAME: troc-cloud-codex-runcmd-policy
     steps:
       - name: Validate exact existing A1
         shell: bash
@@ -49,6 +51,50 @@ jobs:
           echo "TENANCY=$T" >> "$GITHUB_ENV"; echo "INSTANCE_ID=$ID" >> "$GITHUB_ENV"; echo "PUBLIC_IP=$PUB" >> "$GITHUB_ENV"
           echo "SAFE_A1_OK shape=$SH cpu=$CPU ram=$RAM boot=$SIZE ip=$PUB"
 
+      - name: Ensure Run Command dynamic-group IAM permission
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          export SUPPRESS_LABEL_WARNING=True OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING=True
+
+          # Oracle documents that commands remaining ACCEPTED while the plugin appears
+          # RUNNING can be caused by the instance not being authorized to poll the
+          # command-execution family. Give only this exact instance that permission.
+          RULE="instance.id = '$INSTANCE_ID'"
+          DG_JSON="$(oci iam dynamic-group list --compartment-id "$TENANCY" --all)"
+          DG_ID="$(jq -r --arg n "$RUNCOMMAND_DG_NAME" '.data[] | select(.name==$n and ."lifecycle-state"=="ACTIVE") | .id' <<<"$DG_JSON" | head -1)"
+          if [ -z "$DG_ID" ]; then
+            echo 'Creating dedicated dynamic group for this exact A1...'
+            DG_ID="$(oci iam dynamic-group create --compartment-id "$TENANCY" --name "$RUNCOMMAND_DG_NAME" --description 'Run Command polling permission for troc-cloud-codex only' --matching-rule "$RULE" --wait-for-state ACTIVE --query 'data.id' --raw-output)"
+          else
+            CURRENT_RULE="$(jq -r --arg n "$RUNCOMMAND_DG_NAME" '.data[] | select(.name==$n and ."lifecycle-state"=="ACTIVE") | ."matching-rule"' <<<"$DG_JSON" | head -1)"
+            if [ "$CURRENT_RULE" != "$RULE" ]; then
+              echo 'Updating dynamic group to match only the current healthy A1...'
+              oci iam dynamic-group update --dynamic-group-id "$DG_ID" --matching-rule "$RULE" --force >/dev/null
+            fi
+          fi
+          test -n "$DG_ID"
+
+          STATEMENT="Allow dynamic-group $RUNCOMMAND_DG_NAME to use instance-agent-command-execution-family in tenancy"
+          P_JSON="$(oci iam policy list --compartment-id "$TENANCY" --all)"
+          P_ID="$(jq -r --arg n "$RUNCOMMAND_POLICY_NAME" '.data[] | select(.name==$n and ."lifecycle-state"=="ACTIVE") | .id' <<<"$P_JSON" | head -1)"
+          STATEMENTS="$(jq -cn --arg s "$STATEMENT" '[$s]')"
+          if [ -z "$P_ID" ]; then
+            echo 'Creating least-privilege Run Command polling policy...'
+            oci iam policy create --compartment-id "$TENANCY" --name "$RUNCOMMAND_POLICY_NAME" --description 'Allow troc-cloud-codex to consume its Run Commands' --statements "$STATEMENTS" --wait-for-state ACTIVE >/dev/null
+          else
+            CURRENT="$(jq -c --arg n "$RUNCOMMAND_POLICY_NAME" '.data[] | select(.name==$n and ."lifecycle-state"=="ACTIVE") | .statements' <<<"$P_JSON" | head -1)"
+            if ! jq -e --arg s "$STATEMENT" 'index($s) != null' <<<"${CURRENT:-[]}" >/dev/null; then
+              echo 'Repairing Run Command polling policy statement...'
+              oci iam policy update --policy-id "$P_ID" --statements "$STATEMENTS" --force >/dev/null
+            fi
+          fi
+          echo RUNCOMMAND_IAM_READY=1
+
+          # IAM changes are eventually consistent. Give OCI a short propagation window;
+          # the following soft reset restarts Oracle Cloud Agent without recreating A1.
+          sleep 60
+
       - name: Drain stale accepted Run Commands
         shell: bash
         run: |
@@ -63,7 +109,7 @@ jobs:
             echo "Canceling stale accepted command ${C:0:24}..."
             oci instance-agent command cancel --command-id "$C" --region "$REGION" --force >/dev/null 2>&1 || true
           done
-          sleep 20
+          sleep 15
           LEFT="$(oci instance-agent command-execution list --compartment-id "$TENANCY" --instance-id "$INSTANCE_ID" --region "$REGION" --lifecycle-state ACCEPTED --all | jq '.data|length')"
           echo "STALE_ACCEPTED_AFTER_CANCEL=$LEFT"
 
@@ -94,9 +140,9 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
-          C="$(oci instance-agent command create --region "$REGION" --compartment-id "$TENANCY" --target '{"instanceId":"'"$INSTANCE_ID"'"}' --content '{"source":{"sourceType":"TEXT","text":"set -eu; echo GUEST_OK; uname -m"},"output":{"outputType":"TEXT"},"commandString":"/bin/bash"}' --timeout-in-seconds 180 --display-name runcommand-queue-drain-probe --query 'data.id' --raw-output)"
+          C="$(oci instance-agent command create --region "$REGION" --compartment-id "$TENANCY" --target '{"instanceId":"'"$INSTANCE_ID"'"}' --content '{"source":{"sourceType":"TEXT","text":"set -eu; echo GUEST_OK; uname -m"},"output":{"outputType":"TEXT"},"commandString":"/bin/bash"}' --timeout-in-seconds 180 --display-name runcommand-iam-probe --query 'data.id' --raw-output)"
           E=''; S=''
-          for i in $(seq 1 48); do
+          for i in $(seq 1 72); do
             E="$(oci instance-agent command-execution get --command-id "$C" --instance-id "$INSTANCE_ID" --region "$REGION" 2>/dev/null || true)"
             S="$(jq -r '.data."lifecycle-state" // empty' <<<"$E" 2>/dev/null || true)"
             echo "probe_check=$i state=${S:-unknown}"
